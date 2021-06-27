@@ -5,24 +5,24 @@ extern crate regex;
 extern crate tokio;
 extern crate urlencoding;
 
-use base64::decode;
 use bus::{ Bus, BusReader };
 use httpdate::fmt_http_date;
-use path_clean::clean;
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{ HashMap, HashSet };
 use std::error::Error;
 use std::net::{ SocketAddr, IpAddr, Ipv4Addr };
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{ AtomicUsize, Ordering };
 use std::time::SystemTime;
 use tokio::io::{ AsyncReadExt, AsyncWriteExt };
 use tokio::net::{ TcpListener, TcpStream };
 use tokio::sync::{ Mutex, RwLock };
+use uuid::Uuid;
 
 const PORT: u16 = 1900;
 const METAINT: usize = 16_000;
+const BRANDING: &str = "Rusty Zenith";
+const VERSION: &str = "0.1.0";
 
 #[ derive( Clone ) ]
 struct Query {
@@ -32,7 +32,7 @@ struct Query {
 
 struct Client {
 	reader: RwLock< BusReader< Vec< u8 > > >,
-	id: usize,
+	id: Uuid,
 	metadata: bool,
 	uagent: Option< String >
 }
@@ -72,13 +72,13 @@ struct Source {
 	properties: IcyProperties,
 	content_type: String,
 	metadata: Option< IcyMetadata >,
-	bus: RwLock< Bus< Vec< u8 > > >
+	bus: RwLock< Bus< Vec< u8 > > >,
+	clients: HashSet< Uuid >
 }
 
 struct Server {
 	sources: HashMap< String, Arc< RwLock< Source > > >,
-	clients: HashMap< usize, Arc< RwLock< Client > > >,
-	client_counter: AtomicUsize,
+	clients: HashMap< Uuid, Arc< RwLock< Client > > >,
 	icy_metaint: usize
 }
 
@@ -87,7 +87,6 @@ impl Server {
 		Server{
 			sources: HashMap::new(),
 			clients: HashMap::new(),
-			client_counter: AtomicUsize::new( 0 ),
 			icy_metaint: metaint
 		}
 	}
@@ -97,11 +96,17 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 	let mut buf = Vec::new();
 	let mut buffer = [ 0; 512 ];
 	
+	// Get the header
 	while {
 		let mut headers = [ httparse::EMPTY_HEADER; 16 ];
 		let mut req = httparse::Request::new( &mut headers );
-		let read = stream.read( &mut buffer ).await?;
-		buf.extend_from_slice( &buffer[ .. read ] );
+		match stream.read( &mut buffer ).await {
+			Ok( read ) => buf.extend_from_slice( &buffer[ .. read ] ),
+			Err( e ) => {
+				println!( "An error occured while reading a request: {}", e );
+				return Err( Box::new( e ) );
+			}
+		}
 		
 		req.parse( &buf )?.is_partial()
 	} {}
@@ -112,7 +117,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 
 	let method = req.method.unwrap();
 	let ( base_path, queries ) = extract_queries( req.path.unwrap() );
-	let path = clean( base_path );
+	let path = path_clean::clean( base_path );
 	
 	println!( "Received headers with method {} and path {}", method, base_path );
 
@@ -169,6 +174,12 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 			return Ok( () )
 		}
 		
+		let content_type_option = get_header( "Content-Type", req.headers );
+		if content_type_option.is_none() {
+			send_forbidden( &mut stream, Some( "No Content-type given" ) ).await?;
+			return Ok( () )
+		}
+		
 		let mut serv = server.lock().await;
 		// Check if the mountpoint is already in use
 		if serv.sources.contains_key( &path ) {
@@ -176,11 +187,8 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 			return Ok( () )
 		}
 		
-		let content_type_option = get_header( "Content-Type", req.headers );
-		if content_type_option.is_none() {
-			send_forbidden( &mut stream, Some( "No Content-type given" ) ).await?;
-			return Ok( () )
-		}
+		// Give an 200 OK response
+		send_ok( &mut stream, None ).await?;
 		
 		// Parse the headers for the source properties
 		let source = Source {
@@ -192,16 +200,14 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 //				title: Some( "NieR:Automata Piano Collections - 1.1 – Weight of the World // 榊原　大".to_string() ),
 //				url: Some( "https://shop.r10s.jp/book/cabinet/6196/4988601466196.jpg".to_string() )
 //			} ),
-			bus: RwLock::new( Bus::new( 512 ) )
+			bus: RwLock::new( Bus::new( 512 ) ),
+			clients: HashSet::new()
 		};
 		
 		// Add to the server
 		let arc = Arc::new( RwLock::new( source ) );
 		serv.sources.insert( path.clone(), arc.clone() );
 		drop( serv );
-
-		// Give an 200 OK response
-		send_ok( &mut stream, None ).await?;
 		
 		println!( "Successfully mounted source {}", path );
 		
@@ -209,7 +215,13 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 		while {
 			// Read the incoming stream data until it closes
 			let mut buf = [ 0; 1024 ];
-			let read = stream.read( &mut buf ).await?;
+			let read = match stream.read( &mut buf ).await {
+				Ok( n ) => n,
+				Err( e ) => {
+					println!( "An error occured while reading stream data: {}", e );
+					0
+				}
+			};
 			
 			if read != 0 {
 				// Get the slice
@@ -218,8 +230,6 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 				
 				// Broadcast to all listeners
 				arc.read().await.bus.write().await.broadcast( slice );
-			} else {
-				println!( "Received a length of 0!" );
 			}
 			
 			read != 0
@@ -235,7 +245,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 		// TODO Implement the PUT method
 		// For now, return a 405
 		stream.write_all( b"HTTP/1.0 405 Method Not Allowed\r\n" ).await?;
-		stream.write_all( b"Server: Rusty Zenith 0.0.1\r\n" ).await?;
+		stream.write_all( ( format!( "Server: {} {}\r\n", BRANDING, VERSION ) ).as_bytes() ).await?;
 		stream.write_all( b"Connection: Close\r\n" ).await?;
 		stream.write_all( b"Allow: GET, SOURCE\r\n" ).await?;
 		stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
@@ -258,26 +268,36 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 			}
 		};
 		
-		println!( "Attempting to add client to {}", source_id );
-		
 		let mut serv = server.lock().await;
 		let source_option = serv.sources.get( &source_id );
 		// Check if the source is valid
 		if let Some( source_lock ) = source_option {
 			println!( "Received a client on {}", source_id );
-			let source = source_lock.read().await;
+			let mut source = source_lock.write().await;
 			let reader = source.bus.write().await.add_rx();
 			
 			// Reply with a 200 OK
 			send_listener_ok( &mut stream, &source.properties, serv.icy_metaint, source.content_type.as_str() ).await?;
 			
-			// No more need for source
-			drop( source );
-			
 			// Create a client
 			// Check if metadata is enabled
 			let meta_enabled = get_header( "Icy-MetaData", req.headers ).unwrap_or( b"0" ) == b"1";
-			let client_id = serv.client_counter.fetch_add( 1, Ordering::Relaxed );
+			// Get a valid UUID
+			let client_id = {
+				let mut unique = Uuid::new_v4();
+				// Hopefully this doesn't take until the end of time
+				while serv.clients.contains_key( &unique ) {
+					unique = Uuid::new_v4();
+				}
+				unique
+			};
+
+			// Add the client id to the list of clients attached to the source
+			source.clients.insert( client_id );
+
+			// No more need for source
+			drop( source );
+
 			let client = Client{
 				reader: RwLock::new( reader ),
 				id: client_id,
@@ -316,6 +336,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 				// Check if the bus is still alive
 				if let Ok( read ) = res {
 					// Consume it here or something
+					let send: Option< Vec< u8 > >;
 					if meta_enabled {
 						let new_sent = sent_count + read.len();
 						// Check if we need to send the metadata
@@ -354,30 +375,21 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 							
 							// Update the total sent amount and send
 							sent_count = new_sent % metalen;
-							match stream.write_all( &inserted ).await {
-								Ok( _ ) => (),
-								Err( e ) => {
-									println!( "Got a client error {}", e );
-									break
-								}
-							}
+							send = Some( inserted );
 						} else {
 							// Copy over the new amount
 							sent_count = new_sent;
-							// Write it all
-							match stream.write_all( &*read ).await {
-								Ok( _ ) => (),
-								Err( e ) => {
-									println!( "Got a client error {}", e );
-									break
-								}
-							}
+							send = Some( read );
 						}
 					} else {
-						match stream.write_all( &*read ).await {
+						send = Some( read );
+					}
+					
+					if let Some( data ) = send {
+						match stream.write_all( &data ).await {
 							Ok( _ ) => (),
 							Err( e ) => {
-								println!( "Got a client error {}", e );
+								println!( "An error occured while streaming: {}", e );
 								break
 							}
 						}
@@ -390,8 +402,11 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 			println!( "Client {} has disconnected!", client_id );
 			let mut serv = server.lock().await;
 			serv.clients.remove( &client_id );
+			// Remove the client from the list of listeners
+			if let Some( source ) = serv.sources.get( &source_id ) {
+				source.write().await.clients.remove( &client_id );
+			}
 			drop( serv );
-			println!( "Successfully closed out client {}", client_id );
 		} else {
 			// Figure out what the request wants
 			// /admin/metadata for updating the metadata
@@ -446,7 +461,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 										source.write().await.metadata = None;
 									}
 									// Ok
-									send_ok( &mut stream, Some( "Updated metadata" ) ).await?;
+									send_ok( &mut stream, Some( "Success" ) ).await?;
 								} else {
 									// Unknown source
 									send_forbidden( &mut stream, Some( "Invalid mount" ) ).await?;
@@ -475,7 +490,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 	} else {
 		// Unknown
 		stream.write_all( b"HTTP/1.0 405 Method Not Allowed\r\n" ).await?;
-		stream.write_all( b"Server: Rusty Zenith 0.0.1\r\n" ).await?;
+		stream.write_all( ( format!( "Server: {} {}\r\n", BRANDING, VERSION ) ).as_bytes() ).await?;
 		stream.write_all( b"Connection: Close\r\n" ).await?;
 		stream.write_all( b"Allow: GET, SOURCE\r\n" ).await?;
 		stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
@@ -490,7 +505,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 
 async fn send_listener_ok( stream: &mut TcpStream, properties: &IcyProperties, metaint: usize, content_type: &str ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 200 OK\r\n" ).await?;
-	stream.write_all( b"Server: Rusty Zenith 0.0.1\r\n" ).await?;
+	stream.write_all( ( format!( "Server: {} {}\r\n", BRANDING, VERSION ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
 	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
 	stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
@@ -512,7 +527,7 @@ async fn send_listener_ok( stream: &mut TcpStream, properties: &IcyProperties, m
 
 async fn send_not_found( stream: &mut TcpStream, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 404 File Not Found\r\n" ).await?;
-	stream.write_all( b"Server: Rusty Zenith 0.0.1\r\n" ).await?;
+	stream.write_all( ( format!( "Server: {} {}\r\n", BRANDING, VERSION ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
 	if message.is_some() {
 		stream.write_all( b"Content-Type: text/plain; charset=utf-8\r\n" ).await?;
@@ -532,7 +547,7 @@ async fn send_not_found( stream: &mut TcpStream, message: Option< &str > ) -> Re
 
 async fn send_ok( stream: &mut TcpStream, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 200 OK\r\n" ).await?;
-	stream.write_all( b"Server: Rusty Zenith 0.0.1\r\n" ).await?;
+	stream.write_all( ( format!( "Server: {} {}\r\n", BRANDING, VERSION ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
 	if message.is_some() {
 		stream.write_all( b"Content-Type: text/plain; charset=utf-8\r\n" ).await?;
@@ -551,7 +566,7 @@ async fn send_ok( stream: &mut TcpStream, message: Option< &str > ) -> Result< (
 
 async fn send_bad_request( stream: &mut TcpStream, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 400 Bad Request\r\n" ).await?;
-	stream.write_all( b"Server: Rusty Zenith 0.0.1\r\n" ).await?;
+	stream.write_all( ( format!( "Server: {} {}\r\n", BRANDING, VERSION ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
 	if message.is_some() {
 		stream.write_all( b"Content-Type: text/plain; charset=utf-8\r\n" ).await?;
@@ -570,7 +585,7 @@ async fn send_bad_request( stream: &mut TcpStream, message: Option< &str > ) -> 
 
 async fn send_forbidden( stream: &mut TcpStream, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 403 Forbidden\r\n" ).await?;
-	stream.write_all( b"Server: Rusty Zenith 0.0.1\r\n" ).await?;
+	stream.write_all( ( format!( "Server: {} {}\r\n", BRANDING, VERSION ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
 	if message.is_some() {
 		stream.write_all( b"Content-Type: text/plain; charset=utf-8\r\n" ).await?;
@@ -589,7 +604,7 @@ async fn send_forbidden( stream: &mut TcpStream, message: Option< &str > ) -> Re
 
 async fn send_unauthorized( stream: &mut TcpStream, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 401 Authorization Required\r\n" ).await?;
-	stream.write_all( b"Server: Rusty Zenith 0.0.1\r\n" ).await?;
+	stream.write_all( ( format!( "Server: {} {}\r\n", BRANDING, VERSION ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
 	if message.is_some() {
 		stream.write_all( b"Content-Type: text/plain; charset=utf-8\r\n" ).await?;
@@ -698,7 +713,7 @@ fn get_basic_auth( headers: &[ httparse::Header ] ) -> Option< ( String, String 
 	if let Some( auth ) = get_header( "Authorization", headers ) {
 		let reg = Regex::new( r"^Basic ((?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?)$" ).unwrap();
 		if let Some( capture ) = reg.captures( std::str::from_utf8( &auth ).unwrap() ) {
-			if let Some( ( name, pass ) ) = std::str::from_utf8( &decode( &capture[ 1 ] ).unwrap() ).unwrap().split_once( ":" ) {
+			if let Some( ( name, pass ) ) = std::str::from_utf8( &base64::decode( &capture[ 1 ] ).unwrap() ).unwrap().split_once( ":" ) {
 				return Some( ( String::from( name ), String::from( pass ) ) )
 			}
 		}
