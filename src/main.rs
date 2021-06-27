@@ -2,14 +2,19 @@ extern crate base64;
 extern crate bus;
 extern crate httparse;
 extern crate regex;
+extern crate serde_json;
 extern crate tokio;
 extern crate urlencoding;
 
 use bus::{ Bus, BusReader };
 use httpdate::fmt_http_date;
 use regex::Regex;
+use serde::{ Deserialize, Serialize };
+use serde_json::Value;
 use std::collections::{ HashMap, HashSet };
 use std::error::Error;
+use std::fs::File;
+use std::io::{ BufWriter, Write };
 use std::net::{ SocketAddr, IpAddr, Ipv4Addr };
 use std::path::Path;
 use std::sync::Arc;
@@ -76,18 +81,35 @@ struct Source {
 	clients: HashSet< Uuid >
 }
 
+#[ derive( Serialize, Deserialize ) ]
+struct ServerProperties {
+	#[ serde( default = "default_port" ) ]
+	port: u16,
+	#[ serde( default = "default_metaint" ) ]
+	metaint: usize
+}
+
+impl ServerProperties {
+	fn new() -> ServerProperties {
+		ServerProperties {
+			port: PORT,
+			metaint: METAINT
+		}
+	}
+}
+
 struct Server {
 	sources: HashMap< String, Arc< RwLock< Source > > >,
 	clients: HashMap< Uuid, Arc< RwLock< Client > > >,
-	icy_metaint: usize
+	properties: ServerProperties
 }
 
 impl Server {
-	fn new( metaint: usize ) -> Server {
+	fn new( properties: ServerProperties ) -> Server {
 		Server{
 			sources: HashMap::new(),
 			clients: HashMap::new(),
-			icy_metaint: metaint
+			properties
 		}
 	}
 }
@@ -126,6 +148,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 		// Check for authorization
 		if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
 			// For testing purposes right now
+			// TODO Add proper configuration
 			if name != "source" || pass != "hackme" {
 				send_unauthorized( &mut stream, None ).await?;
 				return Ok( () )
@@ -277,7 +300,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 			let reader = source.bus.write().await.add_rx();
 			
 			// Reply with a 200 OK
-			send_listener_ok( &mut stream, &source.properties, serv.icy_metaint, source.content_type.as_str() ).await?;
+			send_listener_ok( &mut stream, &source.properties, serv.properties.metaint, source.content_type.as_str() ).await?;
 			
 			// Create a client
 			// Check if metadata is enabled
@@ -318,7 +341,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 			println!( "Client has metadata: {}", meta_enabled );
 			
 			// Get the metaint
-			let metalen = serv.icy_metaint;
+			let metalen = serv.properties.metaint;
 			// Add our client
 			// The map with an id may be unnecessary, but oh well
 			// That can be removed later
@@ -327,6 +350,9 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 			drop( serv );
 			
 			println!( "Serving client{} ", client_id );
+			
+			// TODO Add bursting
+			// TODO Kick slow listeners
 			
 			let mut sent_count = 0;
 			loop {
@@ -417,6 +443,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 				// Check for authorization
 				if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
 					// For testing purposes right now
+					// TODO Add proper configuration
 					if name != "admin" || pass != "hackme" {
 						send_unauthorized( &mut stream, Some( "Invalid credentials" ) ).await?;
 						return Ok( () )
@@ -721,17 +748,108 @@ fn get_basic_auth( headers: &[ httparse::Header ] ) -> Option< ( String, String 
 	None
 }
 
+// Function taken from https://stackoverflow.com/questions/47070876/how-can-i-merge-two-json-objects-with-rust
+fn merge( a: &mut Value, b: Value ) {
+    if let Value::Object( a ) = a {
+        if let Value::Object( b ) = b {
+            for ( k, v ) in b {
+                if v.is_null() {
+                    a.remove( &k );
+                }
+                else {
+                    merge( a.entry( k ).or_insert( Value::Null ), v );
+                }
+            } 
+
+            return;
+        }
+    }
+
+    *a = b;
+}
+
+fn default_port() -> u16 {
+	PORT
+}
+
+fn default_metaint() -> usize {
+	METAINT
+}
+
 #[ tokio::main ]
-async fn main() -> Result< (), Box< dyn std::error::Error > > {
-	let listener = TcpListener::bind( SocketAddr::new( IpAddr::V4( Ipv4Addr::new( 127, 0, 0, 1 ) ), PORT ) ).await?;
-	let server = Arc::new( Mutex::new( Server::new( METAINT ) ) );
+async fn main() {
+	// TODO Log everything somehow or something
+	let mut properties = ServerProperties::new();
+
+	let args: Vec< String > = std::env::args().collect();
+	let config_location = {
+		if args.len() > 1 {
+			args[ 1 ].clone()
+		} else {
+			match std::env::current_dir() {
+				Ok( mut buf ) => {
+					buf.push( "config" );
+					buf.set_extension( "json" );
+					if let Some( string ) = buf.as_path().to_str() {
+						string.to_string()
+					} else {
+						"config.json".to_string()
+					}
+				}
+				Err( _ ) => "config.json".to_string(),
+			}
+		}
+	};
+	println!( "Using config path {}", config_location );
 	
-	loop {
-		let ( socket, _ ) = listener.accept().await?;
-		let server_clone = server.clone();
-		
-		tokio::spawn( async move {
-			handle_connection( server_clone, socket ).await.unwrap();
-		} );
+	match std::fs::read_to_string( &config_location ) {
+		Ok( contents ) => {
+			println!( "Attempting to parse the config" );
+			match serde_json::from_str( &contents.as_str() ) {
+				Ok( prop ) => properties = prop,
+				Err( e ) => println!( "An error occured while parsing the config: {}", e ),
+			}
+		}
+		Err( e ) if e.kind() == std::io::ErrorKind::NotFound => {
+			println!( "Attempting to save the config to file" );
+			match File::create( &config_location ) {
+				Ok( file ) => {
+					match serde_json::to_string_pretty( &properties ) {
+						Ok( config ) => {
+							let mut writer = BufWriter::new( file );
+							if let Err( e ) = writer.write_all( config.as_bytes() ) {
+								println!( "An error occured while writing to the config file: {}", e );
+							}
+						}
+						Err( e ) => println!( "An error occured while trying to serialize the server properties: {}", e ),
+					}
+				}
+				Err( e ) => println!( "An error occured while to create the config file: {}", e ),
+			}
+		}
+		Err( e ) => println!( "An error occured while trying to read the config: {}", e ),
+	};
+	
+	println!( "Attempting to bind to port {}", properties.port );
+	match TcpListener::bind( SocketAddr::new( IpAddr::V4( Ipv4Addr::new( 127, 0, 0, 1 ) ), properties.port ) ).await {
+		Ok( listener ) => {
+			let server = Arc::new( Mutex::new( Server::new( properties ) ) );
+			
+			loop {
+				match listener.accept().await {
+					Ok( ( socket, addr ) ) => {
+						let server_clone = server.clone();
+						
+						tokio::spawn( async move {
+							if let Err( e ) = handle_connection( server_clone, socket ).await {
+								println!( "An error occured while handling a connection from {}: {}", addr, e );
+							}
+						} );
+					}
+					Err( e ) => println!( "An error occured while accepting a connection: {}", e ),
+				}
+			}
+		}
+		Err( e ) => println!( "Unable to bind to port: {}", e ),
 	}
 }
