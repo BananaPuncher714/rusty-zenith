@@ -10,7 +10,6 @@ use bus::{ Bus, BusReader };
 use httpdate::fmt_http_date;
 use regex::Regex;
 use serde::{ Deserialize, Serialize };
-use serde_json::Value;
 use std::collections::{ HashMap, HashSet };
 use std::error::Error;
 use std::fs::File;
@@ -26,8 +25,10 @@ use uuid::Uuid;
 
 const PORT: u16 = 1900;
 const METAINT: usize = 16_000;
-const BRANDING: &str = "Rusty Zenith";
-const VERSION: &str = "0.1.0";
+const SERVER_ID: &str = "Rusty Zenith 0.1.0";
+const ADMIN: &str = "admin@localhost";
+const HOST: &str = "localhost";
+const LOCATION: &str = "1.048596";
 
 #[ derive( Clone ) ]
 struct Query {
@@ -81,19 +82,31 @@ struct Source {
 	clients: HashSet< Uuid >
 }
 
-#[ derive( Serialize, Deserialize ) ]
+#[ derive( Serialize, Deserialize, Clone ) ]
 struct ServerProperties {
-	#[ serde( default = "default_port" ) ]
+	#[ serde( default = "default_property_port" ) ]
 	port: u16,
-	#[ serde( default = "default_metaint" ) ]
-	metaint: usize
+	#[ serde( default = "default_property_metaint" ) ]
+	metaint: usize,
+	#[ serde( default = "default_property_server_id" ) ]
+	server_id: String,
+	#[ serde( default = "default_property_admin" ) ]
+	admin: String,
+	#[ serde( default = "default_property_host" ) ]
+	host: String,
+	#[ serde( default = "default_property_location" ) ]
+	location: String
 }
 
 impl ServerProperties {
 	fn new() -> ServerProperties {
 		ServerProperties {
 			port: PORT,
-			metaint: METAINT
+			metaint: METAINT,
+			server_id: SERVER_ID.to_string(),
+			admin: ADMIN.to_string(),
+			host: HOST.to_string(),
+			location: LOCATION.to_string()
 		}
 	}
 }
@@ -143,6 +156,10 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 	
 	println!( "Received headers with method {} and path {}", method, base_path );
 
+	let server_id = {
+		server.lock().await.properties.server_id.clone()
+	};
+
 	if method == "SOURCE" {
 		println!( "Received a SOURCE request!" );
 		// Check for authorization
@@ -150,12 +167,12 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 			// For testing purposes right now
 			// TODO Add proper configuration
 			if name != "source" || pass != "hackme" {
-				send_unauthorized( &mut stream, None ).await?;
+				send_unauthorized( &mut stream, server_id, None ).await?;
 				return Ok( () )
 			}
 		} else {
 			// No auth, return and close
-			send_unauthorized( &mut stream, None ).await?;
+			send_unauthorized( &mut stream, server_id, None ).await?;
 			return Ok( () )
 		}
 		
@@ -175,7 +192,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 				path.starts_with( "/admin/" ) ||
 				path == "/api" ||
 				path.starts_with( "/api/" ) {
-			send_forbidden( &mut stream, Some( "Invalid mountpoint" ) ).await?;
+			send_forbidden( &mut stream, server_id, Some( "Invalid mountpoint" ) ).await?;
 			return Ok( () )
 		}
 		
@@ -185,33 +202,33 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 		if let Some( parent ) = dir.parent() {
 			if let Some( parent_str ) = parent.to_str() {
 				if parent_str != "/" {
-					send_forbidden( &mut stream, Some( "Invalid mountpoint" ) ).await?;
+					send_forbidden( &mut stream, server_id, Some( "Invalid mountpoint" ) ).await?;
 					return Ok( () )
 				}
 			} else {
-				send_forbidden( &mut stream, Some( "Invalid mountpoint" ) ).await?;
+				send_forbidden( &mut stream, server_id, Some( "Invalid mountpoint" ) ).await?;
 				return Ok( () )
 			}
 		} else {
-			send_forbidden( &mut stream, Some( "Invalid mountpoint" ) ).await?;
+			send_forbidden( &mut stream, server_id, Some( "Invalid mountpoint" ) ).await?;
 			return Ok( () )
 		}
 		
 		let content_type_option = get_header( "Content-Type", req.headers );
 		if content_type_option.is_none() {
-			send_forbidden( &mut stream, Some( "No Content-type given" ) ).await?;
+			send_forbidden( &mut stream, server_id, Some( "No Content-type given" ) ).await?;
 			return Ok( () )
 		}
 		
 		let mut serv = server.lock().await;
 		// Check if the mountpoint is already in use
 		if serv.sources.contains_key( &path ) {
-			send_forbidden( &mut stream, Some( "Invalid mountpoint" ) ).await?;
+			send_forbidden( &mut stream, server_id, Some( "Invalid mountpoint" ) ).await?;
 			return Ok( () )
 		}
 		
 		// Give an 200 OK response
-		send_ok( &mut stream, None ).await?;
+		send_ok( &mut stream, server_id, None ).await?;
 		
 		// Parse the headers for the source properties
 		let source = Source {
@@ -268,7 +285,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 		// TODO Implement the PUT method
 		// For now, return a 405
 		stream.write_all( b"HTTP/1.0 405 Method Not Allowed\r\n" ).await?;
-		stream.write_all( ( format!( "Server: {} {}\r\n", BRANDING, VERSION ) ).as_bytes() ).await?;
+		stream.write_all( ( format!( "Server: {}\r\n", server_id ) ).as_bytes() ).await?;
 		stream.write_all( b"Connection: Close\r\n" ).await?;
 		stream.write_all( b"Allow: GET, SOURCE\r\n" ).await?;
 		stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
@@ -300,7 +317,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 			let reader = source.bus.write().await.add_rx();
 			
 			// Reply with a 200 OK
-			send_listener_ok( &mut stream, &source.properties, serv.properties.metaint, source.content_type.as_str() ).await?;
+			send_listener_ok( &mut stream, server_id, &source.properties, serv.properties.metaint, source.content_type.as_str() ).await?;
 			
 			// Create a client
 			// Check if metadata is enabled
@@ -445,12 +462,12 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 					// For testing purposes right now
 					// TODO Add proper configuration
 					if name != "admin" || pass != "hackme" {
-						send_unauthorized( &mut stream, Some( "Invalid credentials" ) ).await?;
+						send_unauthorized( &mut stream, server_id, Some( "Invalid credentials" ) ).await?;
 						return Ok( () )
 					}
 				} else {
 					// No auth, return and close
-					send_unauthorized( &mut stream, Some( "You need to authenticate" ) ).await?;
+					send_unauthorized( &mut stream, server_id, Some( "You need to authenticate" ) ).await?;
 					return Ok( () )
 				}
 				
@@ -488,36 +505,36 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 										source.write().await.metadata = None;
 									}
 									// Ok
-									send_ok( &mut stream, Some( "Success" ) ).await?;
+									send_ok( &mut stream, server_id, Some( "Success" ) ).await?;
 								} else {
 									// Unknown source
-									send_forbidden( &mut stream, Some( "Invalid mount" ) ).await?;
+									send_forbidden( &mut stream, server_id, Some( "Invalid mount" ) ).await?;
 								}
 							} else {
-								send_bad_request( &mut stream, Some( "No mount specified" ) ).await?;
+								send_bad_request( &mut stream, server_id, Some( "No mount specified" ) ).await?;
 							}
 						} else {
 							// Don't know what sort of mode
 							// Bad request
-							send_bad_request( &mut stream, Some( "Invalid mode" ) ).await?;
+							send_bad_request( &mut stream, server_id, Some( "Invalid mode" ) ).await?;
 						}
 					} else {
 						// No mode specified
-						send_bad_request( &mut stream, Some( "No mode specified" ) ).await?;
+						send_bad_request( &mut stream, server_id, Some( "No mode specified" ) ).await?;
 					}
 				} else {
 					// Bad request
-					send_bad_request( &mut stream, Some( "Invalid query" ) ).await?;
+					send_bad_request( &mut stream, server_id, Some( "Invalid query" ) ).await?;
 				}
 			} else {
 				// Return 404 for now
-				send_not_found( &mut stream, Some( "<html><head><title>Error 404</title></head><body><b>404 - The file you requested could not be found</b></body></html>" ) ).await?;
+				send_not_found( &mut stream, server_id, Some( "<html><head><title>Error 404</title></head><body><b>404 - The file you requested could not be found</b></body></html>" ) ).await?;
 			}
 		}
 	} else {
 		// Unknown
 		stream.write_all( b"HTTP/1.0 405 Method Not Allowed\r\n" ).await?;
-		stream.write_all( ( format!( "Server: {} {}\r\n", BRANDING, VERSION ) ).as_bytes() ).await?;
+		stream.write_all( ( format!( "Server: {}\r\n", server_id ) ).as_bytes() ).await?;
 		stream.write_all( b"Connection: Close\r\n" ).await?;
 		stream.write_all( b"Allow: GET, SOURCE\r\n" ).await?;
 		stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
@@ -530,9 +547,9 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 	Ok( () )
 }
 
-async fn send_listener_ok( stream: &mut TcpStream, properties: &IcyProperties, metaint: usize, content_type: &str ) -> Result< (), Box< dyn Error > > {
+async fn send_listener_ok( stream: &mut TcpStream, id: String, properties: &IcyProperties, metaint: usize, content_type: &str ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 200 OK\r\n" ).await?;
-	stream.write_all( ( format!( "Server: {} {}\r\n", BRANDING, VERSION ) ).as_bytes() ).await?;
+	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
 	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
 	stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
@@ -552,9 +569,9 @@ async fn send_listener_ok( stream: &mut TcpStream, properties: &IcyProperties, m
 	Ok( () )
 }
 
-async fn send_not_found( stream: &mut TcpStream, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
+async fn send_not_found( stream: &mut TcpStream, id: String, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 404 File Not Found\r\n" ).await?;
-	stream.write_all( ( format!( "Server: {} {}\r\n", BRANDING, VERSION ) ).as_bytes() ).await?;
+	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
 	if message.is_some() {
 		stream.write_all( b"Content-Type: text/plain; charset=utf-8\r\n" ).await?;
@@ -572,9 +589,9 @@ async fn send_not_found( stream: &mut TcpStream, message: Option< &str > ) -> Re
 	Ok( () )
 }
 
-async fn send_ok( stream: &mut TcpStream, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
+async fn send_ok( stream: &mut TcpStream, id: String, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 200 OK\r\n" ).await?;
-	stream.write_all( ( format!( "Server: {} {}\r\n", BRANDING, VERSION ) ).as_bytes() ).await?;
+	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
 	if message.is_some() {
 		stream.write_all( b"Content-Type: text/plain; charset=utf-8\r\n" ).await?;
@@ -591,9 +608,9 @@ async fn send_ok( stream: &mut TcpStream, message: Option< &str > ) -> Result< (
 	Ok( () )
 }
 
-async fn send_bad_request( stream: &mut TcpStream, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
+async fn send_bad_request( stream: &mut TcpStream, id: String, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 400 Bad Request\r\n" ).await?;
-	stream.write_all( ( format!( "Server: {} {}\r\n", BRANDING, VERSION ) ).as_bytes() ).await?;
+	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
 	if message.is_some() {
 		stream.write_all( b"Content-Type: text/plain; charset=utf-8\r\n" ).await?;
@@ -610,9 +627,9 @@ async fn send_bad_request( stream: &mut TcpStream, message: Option< &str > ) -> 
 	Ok( () )
 }
 
-async fn send_forbidden( stream: &mut TcpStream, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
+async fn send_forbidden( stream: &mut TcpStream, id: String, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 403 Forbidden\r\n" ).await?;
-	stream.write_all( ( format!( "Server: {} {}\r\n", BRANDING, VERSION ) ).as_bytes() ).await?;
+	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
 	if message.is_some() {
 		stream.write_all( b"Content-Type: text/plain; charset=utf-8\r\n" ).await?;
@@ -629,9 +646,9 @@ async fn send_forbidden( stream: &mut TcpStream, message: Option< &str > ) -> Re
 	Ok( () )
 }
 
-async fn send_unauthorized( stream: &mut TcpStream, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
+async fn send_unauthorized( stream: &mut TcpStream, id: String, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 401 Authorization Required\r\n" ).await?;
-	stream.write_all( ( format!( "Server: {} {}\r\n", BRANDING, VERSION ) ).as_bytes() ).await?;
+	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
 	if message.is_some() {
 		stream.write_all( b"Content-Type: text/plain; charset=utf-8\r\n" ).await?;
@@ -748,33 +765,30 @@ fn get_basic_auth( headers: &[ httparse::Header ] ) -> Option< ( String, String 
 	None
 }
 
-// Function taken from https://stackoverflow.com/questions/47070876/how-can-i-merge-two-json-objects-with-rust
-fn merge( a: &mut Value, b: Value ) {
-    if let Value::Object( a ) = a {
-        if let Value::Object( b ) = b {
-            for ( k, v ) in b {
-                if v.is_null() {
-                    a.remove( &k );
-                }
-                else {
-                    merge( a.entry( k ).or_insert( Value::Null ), v );
-                }
-            } 
-
-            return;
-        }
-    }
-
-    *a = b;
-}
-
-fn default_port() -> u16 {
+fn default_property_port() -> u16 {
 	PORT
 }
 
-fn default_metaint() -> usize {
+fn default_property_metaint() -> usize {
 	METAINT
 }
+
+fn default_property_server_id() -> String {
+	SERVER_ID.to_string()
+}
+
+fn default_property_admin() -> String {
+	ADMIN.to_string()
+}
+
+fn default_property_host() -> String {
+	HOST.to_string()
+}
+
+fn default_property_location() -> String {
+	LOCATION.to_string()
+}
+
 
 #[ tokio::main ]
 async fn main() {
