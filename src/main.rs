@@ -24,6 +24,7 @@ use tokio::sync::{ Mutex, RwLock };
 use uuid::Uuid;
 
 const PORT: u16 = 1900;
+// The metaint is technically locked to the client
 const METAINT: usize = 16_000;
 const SERVER_ID: &str = "Rusty Zenith 0.1.0";
 const ADMIN: &str = "admin@localhost";
@@ -38,6 +39,7 @@ struct Query {
 
 struct Client {
 	reader: RwLock< BusReader< Vec< u8 > > >,
+	// Is there any point in setting the id of the client here?
 	id: Uuid,
 	metadata: bool,
 	uagent: Option< String >
@@ -50,7 +52,8 @@ struct IcyProperties {
 	description: Option< String >,
 	url: Option< String >,
 	genre: Option< String >,
-	bitrate: Option< String >
+	bitrate: Option< String >,
+	content_type: String
 }
 
 #[ derive( Clone ) ]
@@ -60,7 +63,7 @@ struct IcyMetadata {
 }
 
 impl IcyProperties {
-	fn new() -> IcyProperties {
+	fn new( content_type: String ) -> IcyProperties {
 		IcyProperties{
 			uagent: None,
 			public: false,
@@ -68,15 +71,16 @@ impl IcyProperties {
 			description: None,
 			url: None,
 			genre: None,
-			bitrate: None
+			bitrate: None,
+			content_type
 		}
 	}
 }
 
 struct Source {
+	// Is setting the mountpoint in the source really useful, since it's not like the source has any use for it
 	mountpoint: String,
 	properties: IcyProperties,
-	content_type: String,
 	metadata: Option< IcyMetadata >,
 	bus: RwLock< Bus< Vec< u8 > > >,
 	clients: HashSet< Uuid >
@@ -214,11 +218,13 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 			return Ok( () )
 		}
 		
-		let content_type_option = get_header( "Content-Type", req.headers );
-		if content_type_option.is_none() {
-			send_forbidden( &mut stream, server_id, Some( "No Content-type given" ) ).await?;
-			return Ok( () )
-		}
+		let mut properties = match get_header( "Content-Type", req.headers ) {
+			Some( content_type ) => IcyProperties::new( std::str::from_utf8( content_type ).unwrap().to_string() ),
+			None => {
+				send_forbidden( &mut stream, server_id, Some( "No Content-type given" ) ).await?;
+				return Ok( () )
+			}
+		};
 		
 		let mut serv = server.lock().await;
 		// Check if the mountpoint is already in use
@@ -231,10 +237,12 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 		send_ok( &mut stream, server_id, None ).await?;
 		
 		// Parse the headers for the source properties
+		populate_properties( &mut properties, req.headers );
+		
+		// Create the source
 		let source = Source {
 			mountpoint: path.clone(),
-			properties: get_properties( req.headers ),
-			content_type: std::str::from_utf8( content_type_option.unwrap() ).unwrap().to_string(),
+			properties,
 			metadata: None,
 //			metadata: Some( IcyMetadata {
 //				title: Some( "NieR:Automata Piano Collections - 1.1 – Weight of the World // 榊原　大".to_string() ),
@@ -317,7 +325,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 			let reader = source.bus.write().await.add_rx();
 			
 			// Reply with a 200 OK
-			send_listener_ok( &mut stream, server_id, &source.properties, serv.properties.metaint, source.content_type.as_str() ).await?;
+			send_listener_ok( &mut stream, server_id, &source.properties, serv.properties.metaint ).await?;
 			
 			// Create a client
 			// Check if metadata is enabled
@@ -547,18 +555,21 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 	Ok( () )
 }
 
-async fn send_listener_ok( stream: &mut TcpStream, id: String, properties: &IcyProperties, metaint: usize, content_type: &str ) -> Result< (), Box< dyn Error > > {
+async fn send_listener_ok( stream: &mut TcpStream, id: String, properties: &IcyProperties, metaint: usize ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 200 OK\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
 	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
-	stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
+	stream.write_all( ( format!( "Content-Type: {}\r\n", properties.content_type ) ).as_bytes() ).await?;
 	stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
 	stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
 	stream.write_all( b"Pragma: no-cache\r\n" ).await?;
 	stream.write_all( b"Access-Control-Allow-Origin: *\r\n" ).await?;
 	
 	// Properties or default
+	if let Some( br ) = properties.bitrate.as_ref() {
+		stream.write_all( ( format!( "icy-br:{}\r\n", br ) ).as_bytes() ).await?;
+	}
 	stream.write_all( ( format!( "icy-description:{}\r\n", properties.description.as_ref().unwrap_or( &"Unknown".to_string() ) ) ).as_bytes() ).await?;
 	stream.write_all( ( format!( "icy-genre:{}\r\n", properties.genre.as_ref().unwrap_or( &"Undefined".to_string() ) ) ).as_bytes() ).await?;
 	stream.write_all( ( format!( "icy-name:{}\r\n", properties.name.as_ref().unwrap_or( &"Unnamed Station".to_string() ) ) ).as_bytes() ).await?;
@@ -724,8 +735,7 @@ fn extract_queries( url: &str ) -> ( &str, Option< Vec< Query > > ) {
 	}
 }
 
-fn get_properties( headers: &[ httparse::Header< '_ > ] ) -> IcyProperties {
-	let mut properties = IcyProperties::new();
+fn populate_properties( properties: &mut IcyProperties, headers: &[ httparse::Header< '_ > ] ) {
 	for header in headers {
 		let name = header.name;
 		let val = std::str::from_utf8( header.value ).unwrap_or( "" );
@@ -741,7 +751,6 @@ fn get_properties( headers: &[ httparse::Header< '_ > ] ) -> IcyProperties {
 			_ => (),
 		}
 	}
-	properties
 }
 
 fn get_header< 'a >( key: &str, headers: &[ httparse::Header< 'a > ] ) -> Option< &'a [ u8 ] > {
@@ -765,30 +774,13 @@ fn get_basic_auth( headers: &[ httparse::Header ] ) -> Option< ( String, String 
 	None
 }
 
-fn default_property_port() -> u16 {
-	PORT
-}
-
-fn default_property_metaint() -> usize {
-	METAINT
-}
-
-fn default_property_server_id() -> String {
-	SERVER_ID.to_string()
-}
-
-fn default_property_admin() -> String {
-	ADMIN.to_string()
-}
-
-fn default_property_host() -> String {
-	HOST.to_string()
-}
-
-fn default_property_location() -> String {
-	LOCATION.to_string()
-}
-
+// Serde default deserialization values
+fn default_property_port() -> u16 { PORT }
+fn default_property_metaint() -> usize { METAINT }
+fn default_property_server_id() -> String { SERVER_ID.to_string() }
+fn default_property_admin() -> String { ADMIN.to_string() }
+fn default_property_host() -> String { HOST.to_string() }
+fn default_property_location() -> String { LOCATION.to_string() }
 
 #[ tokio::main ]
 async fn main() {
