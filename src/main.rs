@@ -464,79 +464,51 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 			// Anything else is not vanilla
 			// Return a 404 otherwise
 			
-			if path == "/admin/metadata" {
-				// Check for authorization
-				if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
-					// For testing purposes right now
-					// TODO Add proper configuration
-					if name != "admin" || pass != "hackme" {
-						send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
-						return Ok( () )
-					}
-				} else {
-					// No auth, return and close
-					send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
-					return Ok( () )
-				}
-				
-				// Authentication passed
-				// Now check the query fields
-				// Takes in mode, mount, song and url
-				if let Some( queries ) = queries {
-					let mut mode = None;
-					let mut mount = None;
-					let mut song = None;
-					let mut url = None;
-					for query in queries {
-						println!( "Received query {}={}", query.field, query.value );
-						match query.field.as_str() {
-							"mode" => mode = Some( query.value ),
-							"mount" => mount = Some( query.value ),
-							"song" => song = Some( query.value ),
-							"url" => url = Some( query.value ),
-							_ => (),
-						}
-					}
-					
-					if let Some( mode ) = mode {
-						if mode == "updinfo" {
-							if let Some( mount ) = mount {
-								let source_option = serv.sources.get( &mount );
-								if let Some( source ) = source_option {
-									if song.is_some() || url.is_some() {
-										let new_metadata = IcyMetadata {
-											title: song,
-											url
-										};
-										source.write().await.metadata = Some( new_metadata );
-									} else {
-										source.write().await.metadata = None;
-									}
-									// Ok
-									send_ok( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Success" ) ) ).await?;
-								} else {
-									// Unknown source
-									send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?;
-								}
-							} else {
-								send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "No mount specified" ) ) ).await?;
-							}
-						} else {
-							// Don't know what sort of mode
-							// Bad request
-							send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mode" ) ) ).await?;
+			match path.as_str() {
+				"/admin/metadata" => {
+					// Check for authorization
+					if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
+						// For testing purposes right now
+						// TODO Add proper configuration
+						if name != "admin" || pass != "hackme" {
+							send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
+							return Ok( () )
 						}
 					} else {
-						// No mode specified
-						send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "No mode specified" ) ) ).await?;
+						// No auth, return and close
+						send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
+						return Ok( () )
 					}
-				} else {
-					// Bad request
-					send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
+					
+					// Authentication passed
+					// Now check the query fields
+					// Takes in mode, mount, song and url
+					if let Some( queries ) = queries {
+						match get_queries_for( vec![ "mode", "mount", "song", "url" ], queries )[ .. ].as_ref() {
+							[ Some( mode ), Some( mount ), song, url ] if mode == "updinfo" => {
+								match serv.sources.get( mount ) {
+									Some( source ) => {
+										source.write().await.metadata = match ( song, url ) {
+											( None, None ) => None,
+											_ => Some( IcyMetadata {
+												title: song.clone(),
+												url: url.clone()
+											} ),
+										};
+										send_ok( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Success" ) ) ).await?;
+									}
+									None => send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?,
+								}
+							}
+							_ => (),
+						}
+					} else {
+						// Bad request
+						send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
+					}
 				}
-			} else {
-				// Return 404 for now
-				send_not_found( &mut stream, server_id, Some( ( "text/html; charset=utf-8", "<html><head><title>Error 404</title></head><body><b>404 - The file you requested could not be found</b></body></html>" ) ) ).await?;
+				// Return 404
+				_ => send_not_found( &mut stream, server_id, Some( ( "text/html; charset=utf-8", "<html><head><title>Error 404</title></head><body><b>404 - The file you requested could not be found</b></body></html>" ) ) ).await?,
 			}
 		}
 	} else {
@@ -772,6 +744,21 @@ fn get_basic_auth( headers: &[ httparse::Header ] ) -> Option< ( String, String 
 		}
 	}
 	None
+}
+
+fn get_queries_for( keys: Vec< &str >, queries: Vec< Query > ) -> Vec< Option< String > > {
+	let mut results = vec![ None; keys.len() ];
+	
+	for query in queries {
+		let field = query.field.as_str();
+		for ( i, key ) in keys.iter().enumerate() {
+			if &field == key {
+				results[ i ] = Some( query.value.to_string() );
+			}
+		}
+	}
+	
+	results
 }
 
 // Serde default deserialization values
