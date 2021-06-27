@@ -196,7 +196,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 				path.starts_with( "/admin/" ) ||
 				path == "/api" ||
 				path.starts_with( "/api/" ) {
-			send_forbidden( &mut stream, server_id, Some( "Invalid mountpoint" ) ).await?;
+			send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
 			return Ok( () )
 		}
 		
@@ -206,22 +206,22 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 		if let Some( parent ) = dir.parent() {
 			if let Some( parent_str ) = parent.to_str() {
 				if parent_str != "/" {
-					send_forbidden( &mut stream, server_id, Some( "Invalid mountpoint" ) ).await?;
+					send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
 					return Ok( () )
 				}
 			} else {
-				send_forbidden( &mut stream, server_id, Some( "Invalid mountpoint" ) ).await?;
+				send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
 				return Ok( () )
 			}
 		} else {
-			send_forbidden( &mut stream, server_id, Some( "Invalid mountpoint" ) ).await?;
+			send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
 			return Ok( () )
 		}
 		
 		let mut properties = match get_header( "Content-Type", req.headers ) {
 			Some( content_type ) => IcyProperties::new( std::str::from_utf8( content_type ).unwrap().to_string() ),
 			None => {
-				send_forbidden( &mut stream, server_id, Some( "No Content-type given" ) ).await?;
+				send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "No Content-type given" ) ) ).await?;
 				return Ok( () )
 			}
 		};
@@ -229,7 +229,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 		let mut serv = server.lock().await;
 		// Check if the mountpoint is already in use
 		if serv.sources.contains_key( &path ) {
-			send_forbidden( &mut stream, server_id, Some( "Invalid mountpoint" ) ).await?;
+			send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
 			return Ok( () )
 		}
 		
@@ -470,12 +470,12 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 					// For testing purposes right now
 					// TODO Add proper configuration
 					if name != "admin" || pass != "hackme" {
-						send_unauthorized( &mut stream, server_id, Some( "Invalid credentials" ) ).await?;
+						send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
 						return Ok( () )
 					}
 				} else {
 					// No auth, return and close
-					send_unauthorized( &mut stream, server_id, Some( "You need to authenticate" ) ).await?;
+					send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
 					return Ok( () )
 				}
 				
@@ -513,30 +513,30 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 										source.write().await.metadata = None;
 									}
 									// Ok
-									send_ok( &mut stream, server_id, Some( "Success" ) ).await?;
+									send_ok( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Success" ) ) ).await?;
 								} else {
 									// Unknown source
-									send_forbidden( &mut stream, server_id, Some( "Invalid mount" ) ).await?;
+									send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?;
 								}
 							} else {
-								send_bad_request( &mut stream, server_id, Some( "No mount specified" ) ).await?;
+								send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "No mount specified" ) ) ).await?;
 							}
 						} else {
 							// Don't know what sort of mode
 							// Bad request
-							send_bad_request( &mut stream, server_id, Some( "Invalid mode" ) ).await?;
+							send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mode" ) ) ).await?;
 						}
 					} else {
 						// No mode specified
-						send_bad_request( &mut stream, server_id, Some( "No mode specified" ) ).await?;
+						send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "No mode specified" ) ) ).await?;
 					}
 				} else {
 					// Bad request
-					send_bad_request( &mut stream, server_id, Some( "Invalid query" ) ).await?;
+					send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
 				}
 			} else {
 				// Return 404 for now
-				send_not_found( &mut stream, server_id, Some( "<html><head><title>Error 404</title></head><body><b>404 - The file you requested could not be found</b></body></html>" ) ).await?;
+				send_not_found( &mut stream, server_id, Some( ( "text/html; charset=utf-8", "<html><head><title>Error 404</title></head><body><b>404 - The file you requested could not be found</b></body></html>" ) ) ).await?;
 			}
 		}
 	} else {
@@ -580,19 +580,19 @@ async fn send_listener_ok( stream: &mut TcpStream, id: String, properties: &IcyP
 	Ok( () )
 }
 
-async fn send_not_found( stream: &mut TcpStream, id: String, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
+async fn send_not_found( stream: &mut TcpStream, id: String, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 404 File Not Found\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
-	if message.is_some() {
-		stream.write_all( b"Content-Type: text/plain; charset=utf-8\r\n" ).await?;
+	if let Some( ( content_type, _ ) ) = message {
+		stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
 	}
 	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
 	stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
 	stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
 	stream.write_all( b"Pragma: no-cache\r\n" ).await?;
 	stream.write_all( b"Access-Control-Allow-Origin: *\r\n\r\n" ).await?;
-	if let Some( text ) = message {
+	if let Some( ( _, text ) ) = message {
 		stream.write_all( text.as_bytes() ).await?;
 	}
 //	stream.write_all( b"<html><head><title>Error 404</title></head><body><b>404 - The file you requested could not be found</b></body></html>\r\n" ).await?;
@@ -600,69 +600,69 @@ async fn send_not_found( stream: &mut TcpStream, id: String, message: Option< &s
 	Ok( () )
 }
 
-async fn send_ok( stream: &mut TcpStream, id: String, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
+async fn send_ok( stream: &mut TcpStream, id: String, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 200 OK\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
-	if message.is_some() {
-		stream.write_all( b"Content-Type: text/plain; charset=utf-8\r\n" ).await?;
+	if let Some( ( content_type, _ ) ) = message {
+		stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
 	}
 	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
 	stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
 	stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
 	stream.write_all( b"Pragma: no-cache\r\n" ).await?;
 	stream.write_all( b"Access-Control-Allow-Origin: *\r\n\r\n" ).await?;
-	if let Some( text ) = message {
+	if let Some( ( _, text ) ) = message {
 		stream.write_all( text.as_bytes() ).await?;
 	}
 	
 	Ok( () )
 }
 
-async fn send_bad_request( stream: &mut TcpStream, id: String, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
+async fn send_bad_request( stream: &mut TcpStream, id: String, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 400 Bad Request\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
-	if message.is_some() {
-		stream.write_all( b"Content-Type: text/plain; charset=utf-8\r\n" ).await?;
+	if let Some( ( content_type, _ ) ) = message {
+		stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
 	}
 	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
 	stream.write_all( b"Cache-Control: no-cache\r\n" ).await?;
 	stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
 	stream.write_all( b"Pragma: no-cache\r\n" ).await?;
 	stream.write_all( b"Access-Control-Allow-Origin: *\r\n\r\n" ).await?;
-	if let Some( text ) = message {
+	if let Some( ( _, text ) ) = message {
 		stream.write_all( text.as_bytes() ).await?;
 	}
 	
 	Ok( () )
 }
 
-async fn send_forbidden( stream: &mut TcpStream, id: String, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
+async fn send_forbidden( stream: &mut TcpStream, id: String, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 403 Forbidden\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
-	if message.is_some() {
-		stream.write_all( b"Content-Type: text/plain; charset=utf-8\r\n" ).await?;
+	if let Some( ( content_type, _ ) ) = message {
+		stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
 	}
 	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
 	stream.write_all( b"Cache-Control: no-cache\r\n" ).await?;
 	stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
 	stream.write_all( b"Pragma: no-cache\r\n" ).await?;
 	stream.write_all( b"Access-Control-Allow-Origin: *\r\n\r\n" ).await?;
-	if let Some( text ) = message {
+	if let Some( ( _, text ) ) = message {
 		stream.write_all( text.as_bytes() ).await?;
 	}
 	
 	Ok( () )
 }
 
-async fn send_unauthorized( stream: &mut TcpStream, id: String, message: Option< &str > ) -> Result< (), Box< dyn Error > > {
+async fn send_unauthorized( stream: &mut TcpStream, id: String, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 401 Authorization Required\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
-	if message.is_some() {
-		stream.write_all( b"Content-Type: text/plain; charset=utf-8\r\n" ).await?;
+	if let Some( ( content_type, _ ) ) = message {
+		stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
 	}
 	stream.write_all( b"WWW-Authenticate: Basic realm=\"Icy Server\"\r\n" ).await?;
 	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
@@ -670,7 +670,7 @@ async fn send_unauthorized( stream: &mut TcpStream, id: String, message: Option<
 	stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
 	stream.write_all( b"Pragma: no-cache\r\n" ).await?;
 	stream.write_all( b"Access-Control-Allow-Origin: *\r\n\r\n" ).await?;
-	if let Some( text ) = message {
+	if let Some( ( _, text ) ) = message {
 		stream.write_all( text.as_bytes() ).await?;
 	}
 	
@@ -716,7 +716,7 @@ fn extract_queries( url: &str ) -> ( &str, Option< Vec< Query > > ) {
 	if let Some( ( path, last ) ) = url.split_once( "?" ) {
 		let mut queries: Vec< Query > = Vec::new();
 		for field in last.split( '&' ) {
-			// Apparently decode doesn't treat + as a space
+			// decode doesn't treat + as a space
 			if let Some( ( name, value ) ) = field.replace( "+", " " ).split_once( '=' ) {
 				let name = urlencoding::decode( name );
 				let value = urlencoding::decode( value );
@@ -835,6 +835,13 @@ async fn main() {
 		}
 		Err( e ) => println!( "An error occured while trying to read the config: {}", e ),
 	};
+	
+	println!( "Using PORT       : {}", properties.port );
+	println!( "Using METAINT    : {}", properties.metaint );
+	println!( "Using SERVER ID  : {}", properties.server_id );
+	println!( "Using ADMIN      : {}", properties.admin );
+	println!( "Using HOST       : {}", properties.host );
+	println!( "Using LOCATION   : {}", properties.location );
 	
 	println!( "Attempting to bind to port {}", properties.port );
 	match TcpListener::bind( SocketAddr::new( IpAddr::V4( Ipv4Addr::new( 127, 0, 0, 1 ) ), properties.port ) ).await {
