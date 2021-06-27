@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::io::{ AsyncReadExt, AsyncWriteExt };
 use tokio::net::{ TcpListener, TcpStream };
-use tokio::sync::{ Mutex, RwLock };
+use tokio::sync::RwLock;
 use uuid::Uuid;
 
 const PORT: u16 = 1900;
@@ -87,6 +87,12 @@ struct Source {
 }
 
 #[ derive( Serialize, Deserialize, Clone ) ]
+struct Credential {
+	username: String,
+	password: String
+}
+
+#[ derive( Serialize, Deserialize, Clone ) ]
 struct ServerProperties {
 	#[ serde( default = "default_property_port" ) ]
 	port: u16,
@@ -99,7 +105,8 @@ struct ServerProperties {
 	#[ serde( default = "default_property_host" ) ]
 	host: String,
 	#[ serde( default = "default_property_location" ) ]
-	location: String
+	location: String,
+	users: Vec< Credential >
 }
 
 impl ServerProperties {
@@ -110,7 +117,8 @@ impl ServerProperties {
 			server_id: SERVER_ID.to_string(),
 			admin: ADMIN.to_string(),
 			host: HOST.to_string(),
-			location: LOCATION.to_string()
+			location: LOCATION.to_string(),
+			users: Vec::new()
 		}
 	}
 }
@@ -131,7 +139,7 @@ impl Server {
 	}
 }
 
-async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStream ) -> Result< (), Box< dyn Error > > {
+async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStream ) -> Result< (), Box< dyn Error > > {
 	let mut buf = Vec::new();
 	let mut buffer = [ 0; 512 ];
 	
@@ -161,16 +169,15 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 	println!( "Received headers with method {} and path {}", method, base_path );
 
 	let server_id = {
-		server.lock().await.properties.server_id.clone()
+		server.read().await.properties.server_id.clone()
 	};
-
+	
 	if method == "SOURCE" {
 		println!( "Received a SOURCE request!" );
 		// Check for authorization
 		if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
-			// For testing purposes right now
-			// TODO Add proper configuration
-			if name != "source" || pass != "hackme" {
+			println!( "Checking {}:{}", name, pass );
+			if !validate_user( &server.read().await.properties, name, pass ) {
 				send_unauthorized( &mut stream, server_id, None ).await?;
 				return Ok( () )
 			}
@@ -226,7 +233,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 			}
 		};
 		
-		let mut serv = server.lock().await;
+		let mut serv = server.write().await;
 		// Check if the mountpoint is already in use
 		if serv.sources.contains_key( &path ) {
 			send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
@@ -285,7 +292,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 		
 		println!( "Cleaning up source {}", path );
 		// Clean up and remove the source
-		let mut serv = server.lock().await;
+		let mut serv = server.write().await;
 		serv.sources.remove( &path );
 		println!( "Removed source {}", path );
 	} else if method == "PUT" {
@@ -316,7 +323,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 			}
 		};
 		
-		let mut serv = server.lock().await;
+		let mut serv = server.write().await;
 		let source_option = serv.sources.get( &source_id );
 		// Check if the source is valid
 		if let Some( source_lock ) = source_option {
@@ -394,7 +401,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 						if new_sent > metalen {
 							// Get n and the metadata in a vec
 							let meta_vec = get_metadata_vec( {
-								let serv = server.lock().await;
+								let serv = server.read().await;
 								if let Some( source_lock ) = serv.sources.get( &source_id ) {
 									let source = source_lock.read().await;
 									
@@ -451,7 +458,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 			}
 			
 			println!( "Client {} has disconnected!", client_id );
-			let mut serv = server.lock().await;
+			let mut serv = server.write().await;
 			serv.clients.remove( &client_id );
 			// Remove the client from the list of listeners
 			if let Some( source ) = serv.sources.get( &source_id ) {
@@ -470,7 +477,7 @@ async fn handle_connection( server: Arc< Mutex< Server > >, mut stream: TcpStrea
 					if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
 						// For testing purposes right now
 						// TODO Add proper configuration
-						if name != "admin" || pass != "hackme" {
+						if !validate_user( &serv.properties, name, pass ) {
 							send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
 							return Ok( () )
 						}
@@ -761,6 +768,15 @@ fn get_queries_for( keys: Vec< &str >, queries: Vec< Query > ) -> Vec< Option< S
 	results
 }
 
+fn validate_user( properties: &ServerProperties, username: String, password: String ) -> bool {
+	for cred in &properties.users {
+		if cred.username == username && cred.password == password {
+			return true;
+		}
+	}
+	false
+}
+
 // Serde default deserialization values
 fn default_property_port() -> u16 { PORT }
 fn default_property_metaint() -> usize { METAINT }
@@ -830,26 +846,31 @@ async fn main() {
 	println!( "Using HOST       : {}", properties.host );
 	println!( "Using LOCATION   : {}", properties.location );
 	
-	println!( "Attempting to bind to port {}", properties.port );
-	match TcpListener::bind( SocketAddr::new( IpAddr::V4( Ipv4Addr::new( 127, 0, 0, 1 ) ), properties.port ) ).await {
-		Ok( listener ) => {
-			let server = Arc::new( Mutex::new( Server::new( properties ) ) );
-			
-			loop {
-				match listener.accept().await {
-					Ok( ( socket, addr ) ) => {
-						let server_clone = server.clone();
-						
-						tokio::spawn( async move {
-							if let Err( e ) = handle_connection( server_clone, socket ).await {
-								println!( "An error occured while handling a connection from {}: {}", addr, e );
-							}
-						} );
+	if properties.users.is_empty() {
+		println!( "At least one user must be configured in the config!" );
+	} else {
+		println!( "{} users registered", properties.users.len() );
+		println!( "Attempting to bind to port {}", properties.port );
+		match TcpListener::bind( SocketAddr::new( IpAddr::V4( Ipv4Addr::new( 127, 0, 0, 1 ) ), properties.port ) ).await {
+			Ok( listener ) => {
+				let server = Arc::new( RwLock::new( Server::new( properties ) ) );
+				
+				loop {
+					match listener.accept().await {
+						Ok( ( socket, addr ) ) => {
+							let server_clone = server.clone();
+							
+							tokio::spawn( async move {
+								if let Err( e ) = handle_connection( server_clone, socket ).await {
+									println!( "An error occured while handling a connection from {}: {}", addr, e );
+								}
+							} );
+						}
+						Err( e ) => println!( "An error occured while accepting a connection: {}", e ),
 					}
-					Err( e ) => println!( "An error occured while accepting a connection: {}", e ),
 				}
 			}
+			Err( e ) => println!( "Unable to bind to port: {}", e ),
 		}
-		Err( e ) => println!( "Unable to bind to port: {}", e ),
 	}
 }
