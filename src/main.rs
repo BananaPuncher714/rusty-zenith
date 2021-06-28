@@ -1,8 +1,7 @@
-use bus::{ Bus, BusReader };
 use httpdate::fmt_http_date;
 use regex::Regex;
 use serde::{ Deserialize, Serialize };
-use std::collections::{ HashMap, HashSet };
+use std::collections::{ HashMap };
 use std::error::Error;
 use std::fs::File;
 use std::io::{ BufWriter, ErrorKind, Write };
@@ -13,6 +12,8 @@ use std::time::SystemTime;
 use tokio::io::{ AsyncReadExt, AsyncWriteExt };
 use tokio::net::{ TcpListener, TcpStream };
 use tokio::sync::RwLock;
+use tokio::sync::mpsc::{ UnboundedSender, UnboundedReceiver, unbounded_channel };
+
 use uuid::Uuid;
 
 const PORT: u16 = 1900;
@@ -31,10 +32,17 @@ struct Query {
 
 // TODO Add stats
 struct Client {
-	reader: RwLock< BusReader< Arc< Vec< u8 > > > >,
+	sender: RwLock< UnboundedSender< Arc< Vec< u8 > > > >,
+	receiver: RwLock< UnboundedReceiver< Arc< Vec< u8 > > > >,
+	buffer_size: RwLock< usize >,
+	properties: ClientProperties
+}
+
+#[ derive( Clone ) ]
+struct ClientProperties {
 	id: Uuid,
-	metadata: bool,
-	uagent: Option< String >
+	uagent: Option< String >,
+	metadata: bool
 }
 
 struct IcyProperties {
@@ -76,8 +84,7 @@ struct Source {
 	properties: IcyProperties,
 	metadata: Option< IcyMetadata >,
 	metadata_vec: Vec< u8 >,
-	bus: RwLock< Bus< Arc< Vec< u8 > > > >,
-	clients: HashSet< Uuid >
+	clients: HashMap< Uuid, Arc< RwLock< Client > > >
 }
 
 // TODO Add permissions
@@ -121,7 +128,7 @@ impl ServerProperties {
 // TODO Add stats
 struct Server {
 	sources: HashMap< String, Arc< RwLock< Source > > >,
-	clients: HashMap< Uuid, Arc< RwLock< Client > > >,
+	clients: HashMap< Uuid, ClientProperties >,
 	properties: ServerProperties
 }
 
@@ -243,8 +250,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			properties,
 			metadata: None,
 			metadata_vec: vec![ 0 ],
-			bus: RwLock::new( Bus::new( 512 ) ),
-			clients: HashSet::new()
+			clients: HashMap::new()
 		};
 		
 		// Add to the server
@@ -271,8 +277,30 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				let mut slice: Vec< u8 > = Vec::new();
 				slice.extend_from_slice( &buf[ .. read  ] );
 				
+				let arc_slice = Arc::new( slice );
+					
+				// Remove these later
+				let mut dropped: Vec< Uuid > = Vec::new();
+				
 				// Broadcast to all listeners
-				arc.read().await.bus.write().await.broadcast( Arc::new( slice ) );
+				for ( uuid, cli ) in &arc.write().await.clients {
+					let client = cli.read().await;
+					let mut buf_size = client.buffer_size.write().await;
+					let queue = client.sender.write().await;
+					if read + ( *buf_size ) > 102400 || queue.send( arc_slice.clone() ).is_err() {
+						dropped.push( *uuid );
+					} else {
+						( *buf_size ) += read;
+					}
+				}
+				
+				// Remove clients who have been kicked or disconnected
+				let mut locked = arc.write().await;
+				for uuid in dropped {
+					if let Some( client ) = locked.clients.remove( &uuid ) {
+						drop( client.read().await.sender.write().await.send( Arc::new( Vec::new() ) ) );
+					}
+				}
 			}
 			
 			read != 0
@@ -280,6 +308,12 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 		
 		// Clean up and remove the source
 		let mut serv = server.write().await;
+		// TODO Add a fallback mount
+		for cli in arc.read().await.clients.values() {
+			// Send an empty vec to signify the channel is closed
+			drop( cli.read().await.sender.write().await.send( Arc::new( Vec::new() ) ) );
+		}
+		
 		serv.sources.remove( &path );
 		println!( "Unmounted source {}", path );
 	} else if method == "PUT" {
@@ -312,7 +346,6 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 		// Check if the source is valid
 		if let Some( source_lock ) = source_option {
 			let mut source = source_lock.write().await;
-			let reader = source.bus.write().await.add_rx();
 			
 			// Reply with a 200 OK
 			send_listener_ok( &mut stream, server_id, &source.properties, serv.properties.metaint ).await?;
@@ -330,16 +363,9 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				unique
 			};
 
-			// Add the client id to the list of clients attached to the source
-			source.clients.insert( client_id );
-
-			// No more need for source
-			drop( source );
-
-			let client = Client{
-				reader: RwLock::new( reader ),
+			let ( sender, receiver ) = unbounded_channel::< Arc< Vec< u8 > > >();
+			let properties = ClientProperties {
 				id: client_id,
-				metadata: meta_enabled,
 				uagent: {
 					if let Some( arr ) = get_header( "User-Agent", req.headers ) {
 						if let Ok( parsed ) = std::str::from_utf8( arr ) {
@@ -350,10 +376,18 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					} else {
 						None
 					}
-				}	
+				},
+				metadata: meta_enabled
 			};
+			let client = Client {
+				sender: RwLock::new( sender ),
+				receiver: RwLock::new( receiver ),
+				buffer_size: RwLock::new( 0 ),
+				properties: properties.clone()
+			};
+
 			
-			if let Some( agent ) = &client.uagent {
+			if let Some( agent ) = &client.properties.uagent {
 				println!( "User {} started listening on {} with user-agent {}", client_id, source_id, agent );
 			} else {
 				println!( "User {} started listening on {}", client_id, source_id );
@@ -367,58 +401,83 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			// Add our client
 			// The map with an id may be unnecessary, but oh well
 			// That can be removed later
+			
 			let arc_client = Arc::new( RwLock::new( client ) );
-			serv.clients.insert( client_id, arc_client.clone() );
+			// Add the client id to the list of clients attached to the source
+			source.clients.insert( client_id, arc_client.clone() );
+			// No more need for source
+			drop( source );
+			// TODO Use IDs instead
+			serv.clients.insert( client_id, properties );
 			drop( serv );
 			
 			// TODO Add bursting
-			// TODO Kick slow listeners
 			
 			let mut sent_count = 0;
 			loop {
 				// Receive whatever bytes, then send to the client
 				let client = arc_client.read().await;
-				let res = client.reader.write().await.recv();
+				let mut queue = client.receiver.write().await;
+				let res = queue.recv().await;
 				// Check if the bus is still alive
-				if let Ok( read ) = res {
-					match {
-						if meta_enabled {
-							let meta_vec = {
-								let serv = server.read().await;
-								if let Some( source_lock ) = serv.sources.get( &source_id ) {
-									let source = source_lock.read().await;
-									
-									source.metadata_vec.clone()
-								} else {
-									vec![ 0 ]
-								}
-							};
-							
-							write_to_client( &mut stream, &mut sent_count, metalen, &read.to_vec(), &meta_vec ).await
-						} else {
-							stream.write_all( &read.to_vec() ).await
+				if let Some( read ) = res {
+					// If an empty buffer has been sent, then disconnect the client
+					if read.len() > 0 {
+						*client.buffer_size.write().await -= read.len();
+						match {
+							if meta_enabled {
+								let meta_vec = {
+									let serv = server.read().await;
+									if let Some( source_lock ) = serv.sources.get( &source_id ) {
+										let source = source_lock.read().await;
+										
+										source.metadata_vec.clone()
+									} else {
+										vec![ 0 ]
+									}
+								};
+								
+								// When writing to the client, there is a chance that the buffer is full and blocks
+								// This could cause the bus to fill up, and starve all the clients listening
+								// Ideally, have 2 threads, where one fills a buffer
+								// And the other empties it
+								// If the buffer is full, then kick the listener
+								// Would using a bus make any difference then?
+								// The alternative would be to keep track of each client
+								// and write to their queue whenever possible
+								// The client doesn't know which source it belongs to though
+								// It would need an internal flag to signify that it's been closed
+								write_to_client( &mut stream, &mut sent_count, metalen, &read.to_vec(), &meta_vec ).await
+							} else {
+								stream.write_all( &read.to_vec() ).await
+							}
+						} {
+							Ok( _ ) => (),
+							Err( e ) if e.kind() == ErrorKind::ConnectionReset => break,
+							Err( e ) => {
+								println!( "An error occured while streaming: {}", e );
+								break
+							}
 						}
-					} {
-						Ok( _ ) => (),
-						Err( e ) if e.kind() == ErrorKind::ConnectionReset => break,
-						Err( e ) => {
-							println!( "An error occured while streaming: {}", e );
-							break
-						}
+					} else {
+						break;
 					}
 				} else {
+					// The sender has been dropped
+					// The listener has been kicked
+					println!( "The sender has been dropped!" );
 					break;
 				}
 			}
 			
+			// Close the message queue
+			arc_client.read().await.receiver.write().await.close();
+			
 			println!( "User {} has disconnected", client_id );
 			
 			let mut serv = server.write().await;
+			// Remove the client information from the list of clients
 			serv.clients.remove( &client_id );
-			// Remove the client from the list of listeners
-			if let Some( source ) = serv.sources.get( &source_id ) {
-				source.write().await.clients.remove( &client_id );
-			}
 			drop( serv );
 		} else {
 			// Figure out what the request wants
@@ -446,7 +505,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					// Now check the query fields
 					// Takes in mode, mount, song and url
 					if let Some( queries ) = queries {
-						match get_queries_for( vec![ "mode", "mount", "song", "url" ], queries )[ .. ].as_ref() {
+						match get_queries_for( vec![ "mode", "mount", "song", "url" ], &queries )[ .. ].as_ref() {
 							[ Some( mode ), Some( mount ), song, url ] if mode == "updinfo" => {
 								match serv.sources.get( mount ) {
 									Some( source ) => {
@@ -746,7 +805,7 @@ fn get_basic_auth( headers: &[ httparse::Header ] ) -> Option< ( String, String 
 	None
 }
 
-fn get_queries_for( keys: Vec< &str >, queries: Vec< Query > ) -> Vec< Option< String > > {
+fn get_queries_for( keys: Vec< &str >, queries: &[ Query ] ) -> Vec< Option< String > > {
 	let mut results = vec![ None; keys.len() ];
 	
 	for query in queries {

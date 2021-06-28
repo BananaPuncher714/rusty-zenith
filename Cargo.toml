@@ -6,7 +6,6 @@ edition = "2018"
 
 [dependencies]
 base64 = "0.13.0"
-bus = "2.2.3"
 httparse = "1.4.1"
 httpdate = "1.0.1"
 path-clean = "0.1.0"
