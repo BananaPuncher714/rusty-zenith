@@ -31,7 +31,7 @@ struct Query {
 
 // TODO Add stats
 struct Client {
-	reader: RwLock< BusReader< Vec< u8 > > >,
+	reader: RwLock< BusReader< Arc< Vec< u8 > > > >,
 	id: Uuid,
 	metadata: bool,
 	uagent: Option< String >
@@ -75,7 +75,8 @@ struct Source {
 	mountpoint: String,
 	properties: IcyProperties,
 	metadata: Option< IcyMetadata >,
-	bus: RwLock< Bus< Vec< u8 > > >,
+	metadata_vec: Vec< u8 >,
+	bus: RwLock< Bus< Arc< Vec< u8 > > > >,
 	clients: HashSet< Uuid >
 }
 
@@ -241,6 +242,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			mountpoint: path.clone(),
 			properties,
 			metadata: None,
+			metadata_vec: vec![ 0 ],
 			bus: RwLock::new( Bus::new( 512 ) ),
 			clients: HashSet::new()
 		};
@@ -270,7 +272,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				slice.extend_from_slice( &buf[ .. read  ] );
 				
 				// Broadcast to all listeners
-				arc.read().await.bus.write().await.broadcast( slice );
+				arc.read().await.bus.write().await.broadcast( Arc::new( slice ) );
 			}
 			
 			read != 0
@@ -379,62 +381,29 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				let res = client.reader.write().await.recv();
 				// Check if the bus is still alive
 				if let Ok( read ) = res {
-					// Consume it here or something
-					let send: Option< Vec< u8 > >;
-					if meta_enabled {
-						let new_sent = sent_count + read.len();
-						// Check if we need to send the metadata
-						if new_sent > metalen {
-							// Get n and the metadata in a vec
-							let meta_vec = get_metadata_vec( {
+					match {
+						if meta_enabled {
+							let meta_vec = {
 								let serv = server.read().await;
 								if let Some( source_lock ) = serv.sources.get( &source_id ) {
 									let source = source_lock.read().await;
 									
-									source.metadata.as_ref().cloned()
+									source.metadata_vec.clone()
 								} else {
-									None
+									vec![ 0 ]
 								}
-							} );
+							};
 							
-							// Create a new vector to hold our data
-							let mut inserted: Vec< u8 > = Vec::new();
-							// Insert the current range
-							let mut index = metalen - sent_count;
-							if index > 0 {
-								inserted.extend_from_slice( &read[ .. index ] );
-							}
-							while index < read.len() {
-								inserted.extend_from_slice( &meta_vec );
-								
-								// Add the data
-								let end = std::cmp::min( read.len(), index + metalen );
-								if index != end {
-									inserted.extend_from_slice( &read[ index .. end ] );
-									index = end;
-								}
-							}
-							
-							// Update the total sent amount and send
-							sent_count = new_sent % metalen;
-							send = Some( inserted );
+							write_to_client( &mut stream, &mut sent_count, metalen, &read.to_vec(), &meta_vec ).await
 						} else {
-							// Copy over the new amount
-							sent_count = new_sent;
-							send = Some( read );
+							stream.write_all( &read.to_vec() ).await
 						}
-					} else {
-						send = Some( read );
-					}
-					
-					if let Some( data ) = send {
-						match stream.write_all( &data ).await {
-							Ok( _ ) => (),
-							Err( e ) if e.kind() == ErrorKind::ConnectionReset => break,
-							Err( e ) => {
-								println!( "An error occured while streaming: {}", e );
-								break
-							}
+					} {
+						Ok( _ ) => (),
+						Err( e ) if e.kind() == ErrorKind::ConnectionReset => break,
+						Err( e ) => {
+							println!( "An error occured while streaming: {}", e );
+							break
 						}
 					}
 				} else {
@@ -482,13 +451,15 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 								match serv.sources.get( mount ) {
 									Some( source ) => {
 										println!( "Updated source {} metadata with title '{}' and url '{}'", mount, song.as_ref().unwrap_or( &"".to_string() ), url.as_ref().unwrap_or( &"".to_string() ) );
-										source.write().await.metadata = match ( song, url ) {
+										let mut source = source.write().await;
+										source.metadata = match ( song, url ) {
 											( None, None ) => None,
 											_ => Some( IcyMetadata {
 												title: song.clone(),
 												url: url.clone()
 											} ),
 										};
+										source.metadata_vec = get_metadata_vec( &source.metadata );
 										send_ok( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Success" ) ) ).await?;
 									}
 									None => send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?,
@@ -519,6 +490,42 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 	}
 	
 	Ok( () )
+}
+
+async fn write_to_client( stream: &mut TcpStream, sent_count: &mut usize, metalen: usize, data: &[ u8 ], metadata: &[ u8 ] ) -> Result< (), std::io::Error > {
+	let new_sent = *sent_count + data.len();
+	// Consume it here or something
+	let send: &[ u8 ];
+	// Create a new vector to hold our data, if we need one
+	let mut inserted: Vec< u8 > = Vec::new();
+	// Check if we need to send the metadata
+	if new_sent > metalen {
+		// Insert the current range
+		let mut index = metalen - *sent_count;
+		if index > 0 {
+			inserted.extend_from_slice( &data[ .. index ] );
+		}
+		while index < data.len() {
+			inserted.extend_from_slice( metadata );
+			
+			// Add the data
+			let end = std::cmp::min( data.len(), index + metalen );
+			if index != end {
+				inserted.extend_from_slice( &data[ index .. end ] );
+				index = end;
+			}
+		}
+		
+		// Update the total sent amount and send
+		*sent_count = new_sent % metalen;
+		send = &inserted;
+	} else {
+		// Copy over the new amount
+		*sent_count = new_sent;
+		send = data;
+	}
+	
+	stream.write_all( &send ).await
 }
 
 async fn send_listener_ok( stream: &mut TcpStream, id: String, properties: &IcyProperties, metaint: usize ) -> Result< (), Box< dyn Error > > {
@@ -646,16 +653,15 @@ async fn send_unauthorized( stream: &mut TcpStream, id: String, message: Option<
 /**
  * Get a vector containing n and the padded data
  */
-fn get_metadata_vec( metadata: Option< IcyMetadata > ) -> Vec< u8 > {
-	// Could just return a vec that contains n and any optional data
+fn get_metadata_vec( metadata: &Option< IcyMetadata > ) -> Vec< u8 > {
 	let mut subvec = vec![ 0 ];
 	if let Some( icy_metadata ) = metadata {
 		subvec.extend_from_slice( b"StreamTitle='" );
-		if let Some( title ) = icy_metadata.title {
+		if let Some( title ) = &icy_metadata.title {
 			subvec.extend_from_slice( title.as_bytes() );
 		}
 		subvec.extend_from_slice( b"';StreamUrl='" );
-		if let Some( url ) = icy_metadata.url {
+		if let Some( url ) = &icy_metadata.url {
 			subvec.extend_from_slice( url.as_bytes() );
 		}
 		subvec.extend_from_slice( b"';" );
