@@ -1,7 +1,8 @@
+use bus::{ Bus, BusReader };
 use httpdate::fmt_http_date;
 use regex::Regex;
 use serde::{ Deserialize, Serialize };
-use std::collections::HashMap;
+use std::collections::{ HashMap, HashSet };
 use std::error::Error;
 use std::fs::File;
 use std::io::{ BufWriter, ErrorKind, Write };
@@ -30,60 +31,9 @@ struct Query {
 
 // TODO Add stats
 struct Client {
-	stream: TcpStream,
-	metaint_count: usize,
-	metalen: usize,
-	metadata: bool,
-	properties: ClientProperties
-}
-
-impl Client {
-	async fn send( &mut self,  meta_vec: &[ u8 ], data: &[ u8 ] ) -> Result< (), std::io::Error > {
-		let metalen = self.metalen;
-		let send: &[ u8 ];
-		let read = data.len();
-		
-		// Create a new vector to hold our data if metadata is enabled and inserted
-		let mut inserted: Vec< u8 > = Vec::new();
-		if self.metadata {
-			let new_sent = self.metaint_count + read;
-			// Check if we need to send the metadata
-			if new_sent > metalen {
-				// Insert the current range
-				let mut index = metalen - self.metaint_count;
-				if index > 0 {
-					inserted.extend_from_slice( &data[ .. index ] );
-				}
-				while index < read {
-					inserted.extend_from_slice( &meta_vec );
-					
-					// Add the data
-					let end = std::cmp::min( read, index + metalen );
-					if index != end {
-						inserted.extend_from_slice( &data[ index .. end ] );
-						index = end;
-					}
-				}
-				
-				// Update the total sent amount and send
-				self.metaint_count = new_sent % metalen;
-				send = &inserted;
-			} else {
-				// Copy over the new amount
-				self.metaint_count = new_sent;
-				send = data;
-			}
-		} else {
-			send = data;
-		}
-		
-		self.stream.write_all( send ).await
-	}
-}
-
-#[ derive( Clone ) ]
-struct ClientProperties {
+	reader: RwLock< BusReader< Vec< u8 > > >,
 	id: Uuid,
+	metadata: bool,
 	uagent: Option< String >
 }
 
@@ -125,7 +75,8 @@ struct Source {
 	mountpoint: String,
 	properties: IcyProperties,
 	metadata: Option< IcyMetadata >,
-	clients: HashMap< Uuid, Arc< RwLock< Client > > >
+	bus: RwLock< Bus< Vec< u8 > > >,
+	clients: HashSet< Uuid >
 }
 
 // TODO Add permissions
@@ -169,8 +120,7 @@ impl ServerProperties {
 // TODO Add stats
 struct Server {
 	sources: HashMap< String, Arc< RwLock< Source > > >,
-	// Seems almost pointless to store UUID -> { UUID, Option< String > }?
-	clients: HashMap< Uuid, ClientProperties >,
+	clients: HashMap< Uuid, Arc< RwLock< Client > > >,
 	properties: ServerProperties
 }
 
@@ -291,7 +241,8 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			mountpoint: path.clone(),
 			properties,
 			metadata: None,
-			clients: HashMap::new()
+			bus: RwLock::new( Bus::new( 512 ) ),
+			clients: HashSet::new()
 		};
 		
 		// Add to the server
@@ -318,52 +269,15 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				let mut slice: Vec< u8 > = Vec::new();
 				slice.extend_from_slice( &buf[ .. read  ] );
 				
-				// Get the metadata
-				let meta_vec = get_metadata_vec( &arc.read().await.metadata );
-				
-				let mut dropped: Vec< Uuid > = Vec::new();
-				// TODO Add bursting
-				// TODO Kick slow listeners
 				// Broadcast to all listeners
-				for ( uuid, cli ) in &arc.write().await.clients {
-					// Write to each client here...
-					let mut client = cli.write().await;
-					match client.send( &meta_vec, &slice ).await {
-						Ok( _ ) => (),
-						Err( e ) if e.kind() == ErrorKind::ConnectionReset || e.kind() == ErrorKind::ConnectionAborted => {
-							// The stream was closed by the client
-							// Remove from the stream
-							dropped.push( *uuid );
-						},
-						Err( e ) => {
-							println!( "An error occured while streaming: {}", e );
-							// Remove from the stream
-							dropped.push( *uuid );
-						}
-					}
-				}
-				
-				
-				
-				let mut serv = server.write().await;
-				for uuid in dropped {
-					serv.clients.remove( &uuid );
-					arc.write().await.clients.remove( &uuid );
-					println!( "User {} has disconnected", uuid );
-				}
+				arc.read().await.bus.write().await.broadcast( slice );
 			}
 			
 			read != 0
 		}  {}
 		
-		let mut serv = server.write().await;
-		// Remove all clients
-		// TODO Add a fallback mount
-		for uuid in arc.read().await.clients.keys() {
-			serv.clients.remove( &uuid );
-		}
-		
 		// Clean up and remove the source
+		let mut serv = server.write().await;
 		serv.sources.remove( &path );
 		println!( "Unmounted source {}", path );
 	} else if method == "PUT" {
@@ -396,6 +310,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 		// Check if the source is valid
 		if let Some( source_lock ) = source_option {
 			let mut source = source_lock.write().await;
+			let reader = source.bus.write().await.add_rx();
 			
 			// Reply with a 200 OK
 			send_listener_ok( &mut stream, server_id, &source.properties, serv.properties.metaint ).await?;
@@ -413,8 +328,16 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				unique
 			};
 
-			let properties = ClientProperties {
+			// Add the client id to the list of clients attached to the source
+			source.clients.insert( client_id );
+
+			// No more need for source
+			drop( source );
+
+			let client = Client{
+				reader: RwLock::new( reader ),
 				id: client_id,
+				metadata: meta_enabled,
 				uagent: {
 					if let Some( arr ) = get_header( "User-Agent", req.headers ) {
 						if let Ok( parsed ) = std::str::from_utf8( arr ) {
@@ -425,18 +348,10 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					} else {
 						None
 					}
-				}
-			};
-			let metalen = serv.properties.metaint;
-			let client = Client {
-				stream,
-				metaint_count: 0,
-				metalen,
-				metadata: meta_enabled,
-				properties: properties.clone() 
+				}	
 			};
 			
-			if let Some( agent ) = &client.properties.uagent {
+			if let Some( agent ) = &client.uagent {
 				println!( "User {} started listening on {} with user-agent {}", client_id, source_id, agent );
 			} else {
 				println!( "User {} started listening on {}", client_id, source_id );
@@ -446,15 +361,96 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			}
 			
 			// Get the metaint
+			let metalen = serv.properties.metaint;
 			// Add our client
 			// The map with an id may be unnecessary, but oh well
 			// That can be removed later
 			let arc_client = Arc::new( RwLock::new( client ) );
-			// Add the client id to the list of clients attached to the source
-			source.clients.insert( client_id, arc_client.clone() );
-			// No more need for source
-			drop( source );
-			serv.clients.insert( client_id, properties );
+			serv.clients.insert( client_id, arc_client.clone() );
+			drop( serv );
+			
+			// TODO Add bursting
+			// TODO Kick slow listeners
+			
+			let mut sent_count = 0;
+			loop {
+				// Receive whatever bytes, then send to the client
+				let client = arc_client.read().await;
+				let res = client.reader.write().await.recv();
+				// Check if the bus is still alive
+				if let Ok( read ) = res {
+					// Consume it here or something
+					let send: Option< Vec< u8 > >;
+					if meta_enabled {
+						let new_sent = sent_count + read.len();
+						// Check if we need to send the metadata
+						if new_sent > metalen {
+							// Get n and the metadata in a vec
+							let meta_vec = get_metadata_vec( {
+								let serv = server.read().await;
+								if let Some( source_lock ) = serv.sources.get( &source_id ) {
+									let source = source_lock.read().await;
+									
+									source.metadata.as_ref().cloned()
+								} else {
+									None
+								}
+							} );
+							
+							// Create a new vector to hold our data
+							let mut inserted: Vec< u8 > = Vec::new();
+							// Insert the current range
+							let mut index = metalen - sent_count;
+							if index > 0 {
+								inserted.extend_from_slice( &read[ .. index ] );
+							}
+							while index < read.len() {
+								inserted.extend_from_slice( &meta_vec );
+								
+								// Add the data
+								let end = std::cmp::min( read.len(), index + metalen );
+								if index != end {
+									inserted.extend_from_slice( &read[ index .. end ] );
+									index = end;
+								}
+							}
+							
+							// Update the total sent amount and send
+							sent_count = new_sent % metalen;
+							send = Some( inserted );
+						} else {
+							// Copy over the new amount
+							sent_count = new_sent;
+							send = Some( read );
+						}
+					} else {
+						send = Some( read );
+					}
+					
+					if let Some( data ) = send {
+						match stream.write_all( &data ).await {
+							Ok( _ ) => (),
+							Err( e ) if e.kind() == ErrorKind::ConnectionReset => break,
+							Err( e ) => {
+								println!( "An error occured while streaming: {}", e );
+								break
+							}
+						}
+					}
+				} else {
+					break;
+				}
+			}
+			
+			println!( "User {} has disconnected", client_id );
+			
+			let mut serv = server.write().await;
+			serv.clients.remove( &client_id );
+			// Remove the client from the list of listeners
+			if let Some( source ) = serv.sources.get( &source_id ) {
+				source.write().await.clients.remove( &client_id );
+			}
+			drop( serv );
 		} else {
 			// Figure out what the request wants
 			// /admin/metadata for updating the metadata
@@ -650,16 +646,16 @@ async fn send_unauthorized( stream: &mut TcpStream, id: String, message: Option<
 /**
  * Get a vector containing n and the padded data
  */
-fn get_metadata_vec( metadata: &Option< IcyMetadata > ) -> Vec< u8 > {
+fn get_metadata_vec( metadata: Option< IcyMetadata > ) -> Vec< u8 > {
 	// Could just return a vec that contains n and any optional data
 	let mut subvec = vec![ 0 ];
 	if let Some( icy_metadata ) = metadata {
 		subvec.extend_from_slice( b"StreamTitle='" );
-		if let Some( title ) = &icy_metadata.title {
+		if let Some( title ) = icy_metadata.title {
 			subvec.extend_from_slice( title.as_bytes() );
 		}
 		subvec.extend_from_slice( b"';StreamUrl='" );
-		if let Some( url ) = &icy_metadata.url {
+		if let Some( url ) = icy_metadata.url {
 			subvec.extend_from_slice( url.as_bytes() );
 		}
 		subvec.extend_from_slice( b"';" );
