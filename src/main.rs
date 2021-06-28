@@ -1,11 +1,3 @@
-extern crate base64;
-extern crate bus;
-extern crate httparse;
-extern crate regex;
-extern crate serde_json;
-extern crate tokio;
-extern crate urlencoding;
-
 use bus::{ Bus, BusReader };
 use httpdate::fmt_http_date;
 use regex::Regex;
@@ -13,7 +5,7 @@ use serde::{ Deserialize, Serialize };
 use std::collections::{ HashMap, HashSet };
 use std::error::Error;
 use std::fs::File;
-use std::io::{ BufWriter, Write };
+use std::io::{ BufWriter, ErrorKind, Write };
 use std::net::{ SocketAddr, IpAddr, Ipv4Addr };
 use std::path::Path;
 use std::sync::Arc;
@@ -37,9 +29,9 @@ struct Query {
 	value: String
 }
 
+// TODO Add stats
 struct Client {
 	reader: RwLock< BusReader< Vec< u8 > > >,
-	// Is there any point in setting the id of the client here?
 	id: Uuid,
 	metadata: bool,
 	uagent: Option< String >
@@ -77,6 +69,7 @@ impl IcyProperties {
 	}
 }
 
+// TODO Add stats
 struct Source {
 	// Is setting the mountpoint in the source really useful, since it's not like the source has any use for it
 	mountpoint: String,
@@ -86,6 +79,7 @@ struct Source {
 	clients: HashSet< Uuid >
 }
 
+// TODO Add permissions
 #[ derive( Serialize, Deserialize, Clone ) ]
 struct Credential {
 	username: String,
@@ -123,6 +117,7 @@ impl ServerProperties {
 	}
 }
 
+// TODO Add stats
 struct Server {
 	sources: HashMap< String, Arc< RwLock< Source > > >,
 	clients: HashMap< Uuid, Arc< RwLock< Client > > >,
@@ -166,17 +161,13 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 	let ( base_path, queries ) = extract_queries( req.path.unwrap() );
 	let path = path_clean::clean( base_path );
 	
-	println!( "Received headers with method {} and path {}", method, base_path );
-
 	let server_id = {
 		server.read().await.properties.server_id.clone()
 	};
 	
 	if method == "SOURCE" {
-		println!( "Received a SOURCE request!" );
 		// Check for authorization
 		if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
-			println!( "Checking {}:{}", name, pass );
 			if !validate_user( &server.read().await.properties, name, pass ) {
 				send_unauthorized( &mut stream, server_id, None ).await?;
 				return Ok( () )
@@ -207,7 +198,6 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			return Ok( () )
 		}
 		
-		println!( "Source is attempting to use mountpoint {}", path );
 		// Check if it is valid
 		let dir = Path::new( &path );
 		if let Some( parent ) = dir.parent() {
@@ -251,10 +241,6 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			mountpoint: path.clone(),
 			properties,
 			metadata: None,
-//			metadata: Some( IcyMetadata {
-//				title: Some( "NieR:Automata Piano Collections - 1.1 – Weight of the World // 榊原　大".to_string() ),
-//				url: Some( "https://shop.r10s.jp/book/cabinet/6196/4988601466196.jpg".to_string() )
-//			} ),
 			bus: RwLock::new( Bus::new( 512 ) ),
 			clients: HashSet::new()
 		};
@@ -264,7 +250,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 		serv.sources.insert( path.clone(), arc.clone() );
 		drop( serv );
 		
-		println!( "Successfully mounted source {}", path );
+		println!( "Mounted source on {}", path );
 		
 		// Listen for bytes
 		while {
@@ -290,13 +276,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			read != 0
 		}  {}
 		
-		println!( "Cleaning up source {}", path );
 		// Clean up and remove the source
 		let mut serv = server.write().await;
 		serv.sources.remove( &path );
-		println!( "Removed source {}", path );
+		println!( "Unmounted source {}", path );
 	} else if method == "PUT" {
-		println!( "Received a PUT request!" );
 		// TODO Implement the PUT method
 		// For now, return a 405
 		stream.write_all( b"HTTP/1.0 405 Method Not Allowed\r\n" ).await?;
@@ -309,8 +293,6 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 		stream.write_all( b"Pragma: no-cache\r\n\r\n" ).await?;
 		stream.write_all( b"Access-Control-Allow-Origin: *\r\n" ).await?;
 	} else if method == "GET" {
-		println!( "Received a GET request!" );
-		
 		let source_id = path.to_owned();
 		let source_id = {
 			// Remove the trailing '/'
@@ -327,7 +309,6 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 		let source_option = serv.sources.get( &source_id );
 		// Check if the source is valid
 		if let Some( source_lock ) = source_option {
-			println!( "Received a client on {}", source_id );
 			let mut source = source_lock.write().await;
 			let reader = source.bus.write().await.add_rx();
 			
@@ -370,7 +351,14 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				}	
 			};
 			
-			println!( "Client has metadata: {}", meta_enabled );
+			if let Some( agent ) = &client.uagent {
+				println!( "User {} started listening on {} with user-agent {}", client_id, source_id, agent );
+			} else {
+				println!( "User {} started listening on {}", client_id, source_id );
+			}
+			if meta_enabled {
+				println!( "User {} has icy metadata enabled", client_id );
+			}
 			
 			// Get the metaint
 			let metalen = serv.properties.metaint;
@@ -380,8 +368,6 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			let arc_client = Arc::new( RwLock::new( client ) );
 			serv.clients.insert( client_id, arc_client.clone() );
 			drop( serv );
-			
-			println!( "Serving client{} ", client_id );
 			
 			// TODO Add bursting
 			// TODO Kick slow listeners
@@ -426,8 +412,6 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 								if index != end {
 									inserted.extend_from_slice( &read[ index .. end ] );
 									index = end;
-								} else {
-									// index should equal read.len() at this point, unless metalen is 0
 								}
 							}
 							
@@ -446,6 +430,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					if let Some( data ) = send {
 						match stream.write_all( &data ).await {
 							Ok( _ ) => (),
+							Err( e ) if e.kind() == ErrorKind::ConnectionReset => break,
 							Err( e ) => {
 								println!( "An error occured while streaming: {}", e );
 								break
@@ -457,7 +442,8 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				}
 			}
 			
-			println!( "Client {} has disconnected!", client_id );
+			println!( "User {} has disconnected", client_id );
+			
 			let mut serv = server.write().await;
 			serv.clients.remove( &client_id );
 			// Remove the client from the list of listeners
@@ -495,6 +481,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							[ Some( mode ), Some( mount ), song, url ] if mode == "updinfo" => {
 								match serv.sources.get( mount ) {
 									Some( source ) => {
+										println!( "Updated source {} metadata with title '{}' and url '{}'", mount, song.as_ref().unwrap_or( &"".to_string() ), url.as_ref().unwrap_or( &"".to_string() ) );
 										source.write().await.metadata = match ( song, url ) {
 											( None, None ) => None,
 											_ => Some( IcyMetadata {
@@ -855,6 +842,7 @@ async fn main() {
 			Ok( listener ) => {
 				let server = Arc::new( RwLock::new( Server::new( properties ) ) );
 				
+				println!( "Listening..." );				
 				loop {
 					match listener.accept().await {
 						Ok( ( socket, addr ) ) => {
