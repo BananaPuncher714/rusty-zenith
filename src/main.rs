@@ -16,17 +16,29 @@ use tokio::sync::mpsc::{ UnboundedSender, UnboundedReceiver, unbounded_channel }
 use tokio::time::timeout;
 use uuid::Uuid;
 
+// Default constants
 const PORT: u16 = 1900;
-// The metaint is technically locked to the client
+// The default interval in bytes between icy metadata chunks
+// The metaint cannot be changed per client once the response has been sent
+// https://thecodeartist.blogspot.com/2013/02/shoutcast-internet-radio-protocol.html
 const METAINT: usize = 16_000;
+// Server that gets sent in the header
 const SERVER_ID: &str = "Rusty Zenith 0.1.0";
+// Contact information
 const ADMIN: &str = "admin@localhost";
+// Public facing domain/address
 const HOST: &str = "localhost";
+// Geographic location. Icecast included it in their settings, so why not
 const LOCATION: &str = "1.048596";
 
+// How many bytes a client can have queued until they get disconnected
 const QUEUE_SIZE: usize = 102400;
+// How many bytes to send to the client all at once when they first connect
+// Useful for filling up the client buffer quickly, but also introduces some delay
 const BURST_SIZE: usize = 65536;
+// How long in milliseconds a client has to send a complete request
 const HEADER_TIMEOUT: u64 = 15_000;
+// How long in milliseconds a source has to send something before being disconnected
 const SOURCE_TIMEOUT: u64 = 10_000;
 
 #[ derive( Clone ) ]
@@ -128,6 +140,7 @@ struct ServerProperties {
 	location: String,
 	#[ serde( default = "default_property_limits" ) ]
 	limits: ServerLimits,
+	#[ serde( default = "default_property_users" ) ]
 	users: Vec< Credential >
 }
 
@@ -218,10 +231,12 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 	};
 	
 	match method {
+		// Some info about the protocol is provided here: https://gist.github.com/ePirat/adc3b8ba00d85b7e3870
 		"SOURCE" => {
 			// Check for authorization
 			if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
 				if !validate_user( &server.read().await.properties, name, pass ) {
+					// Invalid user/pass provided
 					send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=urf-8", "Invalid credentials" ) ) ).await?;
 					return Ok( () )
 				}
@@ -231,6 +246,8 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				return Ok( () )
 			}
 			
+			// http://example.com/radio == http://example.com/radio/
+			// Not sure if this is done client-side prior to sending the request though
 			let path = {
 				// Remove the trailing '/'
 				if path.ends_with( '/' ) {
@@ -243,6 +260,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			};
 			
 			// Check if the path contains 'admin' or 'api'
+			// TODO Allow for custom stream directory, such as http://example.com/stream/radio
 			if path == "/admin" ||
 					path.starts_with( "/admin/" ) ||
 					path == "/api" ||
@@ -252,6 +270,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			}
 			
 			// Check if it is valid
+			// For now this assumes the stream directory is /
 			let dir = Path::new( &path );
 			if let Some( parent ) = dir.parent() {
 				if let Some( parent_str ) = parent.to_str() {
@@ -359,6 +378,8 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 		}
 		"PUT" => {
 			// TODO Implement the PUT method
+			// I don't know any sources that use this method that I could easily get my hands on
+			// VLC only uses SHOUT
 			// For now, return a 405
 			stream.write_all( b"HTTP/1.0 405 Method Not Allowed\r\n" ).await?;
 			stream.write_all( ( format!( "Server: {}\r\n", server_id ) ).as_bytes() ).await?;
@@ -368,7 +389,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
 			stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
 			stream.write_all( b"Pragma: no-cache\r\n\r\n" ).await?;
-			stream.write_all( b"Access-Control-Allow-Origin: *\r\n" ).await?;
+			stream.write_all( b"Access-Control-Allow-Origin: *\r\n\r\n" ).await?;
 		}
 		"GET" => {
 			let source_id = path.to_owned();
@@ -440,9 +461,6 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				
 				// Get the metaint
 				let metalen = serv.properties.metaint;
-				// Add our client
-				// The map with an id may be unnecessary, but oh well
-				// That can be removed later
 				
 				let arc_client = Arc::new( RwLock::new( client ) );
 				
@@ -472,6 +490,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				source.clients.insert( client_id, arc_client.clone() );
 				// No more need for source
 				drop( source );
+				// Add our client
 				serv.clients.insert( client_id, properties );
 				drop( serv );
 				
@@ -480,10 +499,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					let client = arc_client.read().await;
 					let mut queue = client.receiver.write().await;
 					let res = queue.recv().await;
-					// Check if the bus is still alive
+					// Check if the channel is still alive
 					if let Some( read ) = res {
 						// If an empty buffer has been sent, then disconnect the client
 						if read.len() > 0 {
+							// Decrease the internal buffer
 							*client.buffer_size.write().await -= read.len();
 							match {
 								if meta_enabled {
@@ -516,7 +536,6 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					} else {
 						// The sender has been dropped
 						// The listener has been kicked
-						println!( "The sender has been dropped!" );
 						break;
 					}
 				}
@@ -533,7 +552,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			} else {
 				// Figure out what the request wants
 				// /admin/metadata for updating the metadata
-				// Anything else is not vanilla
+				// Anything else is not vanilla or unimplemented
 				// Return a 404 otherwise
 				
 				match path.as_str() {
@@ -596,8 +615,8 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
 			stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
 			stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
-			stream.write_all( b"Pragma: no-cache\r\n\r\n" ).await?;
-			stream.write_all( b"Access-Control-Allow-Origin: *\r\n" ).await?;
+			stream.write_all( b"Pragma: no-cache\r\n" ).await?;
+			stream.write_all( b"Access-Control-Allow-Origin: *\r\n\r\n" ).await?;
 		}
 	}
 	
@@ -867,6 +886,8 @@ fn populate_properties( properties: &mut IcyProperties, headers: &[ httparse::He
 		let name = header.name;
 		let val = std::str::from_utf8( header.value ).unwrap_or( "" );
 		
+		// There's a nice list here: https://github.com/ben221199/MediaCast
+		// Although, these were taken directly from Icecast's source: https://github.com/xiph/Icecast-Server/blob/master/src/source.c
 		match name {
 			"User-Agent" => properties.uagent = Some( val.to_string() ),
 			"ice-public" | "icy-pub" | "x-audiocast-public" | "icy-public" => properties.public = val.parse::< usize >().unwrap_or( 0 ) == 1,
@@ -916,6 +937,7 @@ fn get_queries_for( keys: Vec< &str >, queries: &[ Query ] ) -> Vec< Option< Str
 	results
 }
 
+// TODO Add some sort of permission system
 fn validate_user( properties: &ServerProperties, username: String, password: String ) -> bool {
 	for cred in &properties.users {
 		if cred.username == username && cred.password == password {
@@ -932,6 +954,7 @@ fn default_property_server_id() -> String { SERVER_ID.to_string() }
 fn default_property_admin() -> String { ADMIN.to_string() }
 fn default_property_host() -> String { HOST.to_string() }
 fn default_property_location() -> String { LOCATION.to_string() }
+fn default_property_users() -> Vec< Credential > { vec![ Credential{ username: "admin".to_string(), password: "hackme".to_string() }, Credential { username: "source".to_string(), password: "hackme".to_string() } ] }
 fn default_property_limits() -> ServerLimits { ServerLimits{ queue_size: default_property_limits_queue_size(), burst_size: default_property_limits_burst_size(), header_timeout: default_property_limits_header_timeout(), source_timeout: default_property_limits_source_timeout() } }
 fn default_property_limits_queue_size() -> usize { QUEUE_SIZE }
 fn default_property_limits_burst_size() -> usize { BURST_SIZE }
