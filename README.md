@@ -14,7 +14,8 @@ This program was created to allow updating and sending of a stream url in the ic
 
 ## Config
 <details>
-  <summary>**Default configuration** *(Click to expand)*</summary>
+  <summary>Default configuration (Click to expand)</summary> 
+  
 ```json
 {
   "port": 1900,
@@ -41,6 +42,7 @@ This program was created to allow updating and sending of a stream url in the ic
   ]
 }
 ```
+
 </details>
 
 - `port`: The port to use for serving requests and accepting clients
