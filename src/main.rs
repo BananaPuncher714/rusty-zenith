@@ -8,12 +8,12 @@ use std::io::{ BufWriter, ErrorKind, Write };
 use std::net::{ SocketAddr, IpAddr, Ipv4Addr };
 use std::path::Path;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{ Duration, SystemTime };
 use tokio::io::{ AsyncReadExt, AsyncWriteExt };
 use tokio::net::{ TcpListener, TcpStream };
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::{ UnboundedSender, UnboundedReceiver, unbounded_channel };
-
+use tokio::time::timeout;
 use uuid::Uuid;
 
 const PORT: u16 = 1900;
@@ -26,6 +26,8 @@ const LOCATION: &str = "1.048596";
 
 const QUEUE_SIZE: usize = 102400;
 const BURST_SIZE: usize = 65536;
+const HEADER_TIMEOUT: u64 = 15_000;
+const SOURCE_TIMEOUT: u64 = 10_000;
 
 #[ derive( Clone ) ]
 struct Query {
@@ -103,7 +105,11 @@ struct ServerLimits {
 	#[ serde( default = "default_property_limits_queue_size" ) ]
 	queue_size: usize,
 	#[ serde( default = "default_property_limits_burst_size" ) ]
-	burst_size: usize
+	burst_size: usize,
+	#[ serde( default = "default_property_limits_header_timeout" ) ]
+	header_timeout: u64,
+	#[ serde( default = "default_property_limits_source_timeout" ) ]
+	source_timeout: u64
 }
 
 #[ derive( Serialize, Deserialize, Clone ) ]
@@ -160,28 +166,44 @@ impl Server {
 async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStream ) -> Result< (), Box< dyn Error > > {
 	let mut buf = Vec::new();
 	let mut buffer = [ 0; 512 ];
-	
-	// Get the header
-	// TODO Add a timeout
-	while {
-		let mut headers = [ httparse::EMPTY_HEADER; 16 ];
-		let mut req = httparse::Request::new( &mut headers );
-		match stream.read( &mut buffer ).await {
-			Ok( read ) => buf.extend_from_slice( &buffer[ .. read ] ),
-			Err( e ) => {
-				println!( "An error occured while reading a request: {}", e );
-				return Ok( () )
+
+	let header_timeout = server.read().await.properties.limits.header_timeout;
+
+	// Add a timeout
+	match timeout( Duration::from_millis( header_timeout ), async {
+		// Get the header
+		while {
+			let mut headers = [ httparse::EMPTY_HEADER; 16 ];
+			let mut req = httparse::Request::new( &mut headers );
+			match stream.read( &mut buffer ).await {
+				Ok( read ) => buf.extend_from_slice( &buffer[ .. read ] ),
+				Err( e ) => {
+					println!( "An error occured while reading a request: {}", e );
+					return Err( e )
+				}
 			}
-		}
+			
+			match req.parse( &buf ) {
+				Ok( res ) => res.is_partial(),
+				Err( e ) => {
+					println!( "An error occured while parsing a request: {}", e );
+					return Err( std::io::Error::new( ErrorKind::Other, "Failed to parse an invalid request" ) )
+				}
+			}
+		} {}
 		
-		match req.parse( &buf ) {
-			Ok( res ) => res.is_partial(),
-			Err( e ) => {
-				println!( "An error occured while parsing a request: {}", e );
+		Ok( () )
+	} ).await {
+		Ok( res ) => {
+			if res.is_err() {
 				return Ok( () )
 			}
 		}
-	} {}
+		Err( _ ) => {
+			println!( "An incoming request failed to complete in time" );
+			return Ok( () )
+		}
+	}
 
 	let mut headers = [ httparse::EMPTY_HEADER; 16 ];
 	let mut req = httparse::Request::new( &mut headers );
@@ -282,19 +304,29 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 		// Add to the server
 		let arc = Arc::new( RwLock::new( source ) );
 		serv.sources.insert( path.clone(), arc.clone() );
+		let source_timeout = serv.properties.limits.header_timeout;
 		drop( serv );
 		
 		println!( "Mounted source on {}", path );
+		
+		// TODO Broadcast bytes that might have been sent with the header
 		
 		// Listen for bytes
 		while {
 			// Read the incoming stream data until it closes
 			let mut buf = [ 0; 1024 ];
-			// TODO Add a timeout
-			let read = match stream.read( &mut buf ).await {
+			let read = match timeout( Duration::from_millis( source_timeout ), async {
+				match stream.read( &mut buf ).await {
+					Ok( n ) => n,
+					Err( e ) => {
+						println!( "An error occured while reading stream data: {}", e );
+						0
+					}
+				}
+			} ).await {
 				Ok( n ) => n,
-				Err( e ) => {
-					println!( "An error occured while reading stream data: {}", e );
+				Err( _ ) => {
+					println!( "A source timed out: {}", path );
 					0
 				}
 			};
@@ -304,41 +336,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				let mut slice: Vec< u8 > = Vec::new();
 				slice.extend_from_slice( &buf[ .. read  ] );
 				
-				let arc_slice = Arc::new( slice );
-					
-				// Remove these later
-				let mut dropped: Vec< Uuid > = Vec::new();
-				
-				let mut locked = arc.write().await;
-				
-				// Broadcast to all listeners
-				for ( uuid, cli ) in &locked.clients {
-					let client = cli.read().await;
-					let mut buf_size = client.buffer_size.write().await;
-					let queue = client.sender.write().await;
-					if read + ( *buf_size ) > queue_size || queue.send( arc_slice.clone() ).is_err() {
-						dropped.push( *uuid );
-					} else {
-						( *buf_size ) += read;
-					}
-				}
-				
-				// Fill the burst on connect buffer
-				if burst_size > 0 {
-					let burst_buf = &mut locked.burst_buffer;
-					burst_buf.extend_from_slice( &arc_slice );
-					// Trim it if it's larger than the allowed size
-					if burst_buf.len() > burst_size {
-						burst_buf.drain( .. burst_buf.len() - burst_size );
-					}
-				}
-				
-				// Remove clients who have been kicked or disconnected
-				for uuid in dropped {
-					if let Some( client ) = locked.clients.remove( &uuid ) {
-						drop( client.read().await.sender.write().await.send( Arc::new( Vec::new() ) ) );
-					}
-				}
+				broadcast_to_clients( &arc, slice, queue_size, burst_size ).await;
 			}
 			
 			read != 0
@@ -598,6 +596,45 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 	Ok( () )
 }
 
+async fn broadcast_to_clients( source: &Arc< RwLock< Source > >, data: Vec< u8 >, queue_size: usize, burst_size: usize ) {
+	// Remove these later
+	let mut dropped: Vec< Uuid > = Vec::new();
+	
+	let read = data.len();
+	let arc_slice = Arc::new( data );
+	
+	let mut locked = source.write().await;
+	
+	// Broadcast to all listeners
+	for ( uuid, cli ) in &locked.clients {
+		let client = cli.read().await;
+		let mut buf_size = client.buffer_size.write().await;
+		let queue = client.sender.write().await;
+		if read + ( *buf_size ) > queue_size || queue.send( arc_slice.clone() ).is_err() {
+			dropped.push( *uuid );
+		} else {
+			( *buf_size ) += read;
+		}
+	}
+	
+	// Fill the burst on connect buffer
+	if burst_size > 0 {
+		let burst_buf = &mut locked.burst_buffer;
+		burst_buf.extend_from_slice( &arc_slice );
+		// Trim it if it's larger than the allowed size
+		if burst_buf.len() > burst_size {
+			burst_buf.drain( .. burst_buf.len() - burst_size );
+		}
+	}
+	
+	// Remove clients who have been kicked or disconnected
+	for uuid in dropped {
+		if let Some( client ) = locked.clients.remove( &uuid ) {
+			drop( client.read().await.sender.write().await.send( Arc::new( Vec::new() ) ) );
+		}
+	}
+}
+
 async fn write_to_client( stream: &mut TcpStream, sent_count: &mut usize, metalen: usize, data: &[ u8 ], metadata: &[ u8 ] ) -> Result< (), std::io::Error > {
 	let new_sent = *sent_count + data.len();
 	// Consume it here or something
@@ -663,8 +700,9 @@ async fn send_not_found( stream: &mut TcpStream, id: String, message: Option< ( 
 	stream.write_all( b"HTTP/1.0 404 File Not Found\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
-	if let Some( ( content_type, _ ) ) = message {
+	if let Some( ( content_type, text ) ) = message {
 		stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
+		stream.write_all( ( format!( "Content-Length: {}\r\n", text.len() ) ).as_bytes() ).await?;
 	}
 	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
 	stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
@@ -682,8 +720,9 @@ async fn send_ok( stream: &mut TcpStream, id: String, message: Option< ( &str, &
 	stream.write_all( b"HTTP/1.0 200 OK\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
-	if let Some( ( content_type, _ ) ) = message {
+	if let Some( ( content_type, text ) ) = message {
 		stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
+		stream.write_all( ( format!( "Content-Length: {}\r\n", text.len() ) ).as_bytes() ).await?;
 	}
 	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
 	stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
@@ -701,8 +740,9 @@ async fn send_bad_request( stream: &mut TcpStream, id: String, message: Option< 
 	stream.write_all( b"HTTP/1.0 400 Bad Request\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
-	if let Some( ( content_type, _ ) ) = message {
+	if let Some( ( content_type, text ) ) = message {
 		stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
+		stream.write_all( ( format!( "Content-Length: {}\r\n", text.len() ) ).as_bytes() ).await?;
 	}
 	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
 	stream.write_all( b"Cache-Control: no-cache\r\n" ).await?;
@@ -720,8 +760,9 @@ async fn send_forbidden( stream: &mut TcpStream, id: String, message: Option< ( 
 	stream.write_all( b"HTTP/1.0 403 Forbidden\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
-	if let Some( ( content_type, _ ) ) = message {
+	if let Some( ( content_type, text ) ) = message {
 		stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
+		stream.write_all( ( format!( "Content-Length: {}\r\n", text.len() ) ).as_bytes() ).await?;
 	}
 	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
 	stream.write_all( b"Cache-Control: no-cache\r\n" ).await?;
@@ -739,8 +780,9 @@ async fn send_unauthorized( stream: &mut TcpStream, id: String, message: Option<
 	stream.write_all( b"HTTP/1.0 401 Authorization Required\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
-	if let Some( ( content_type, _ ) ) = message {
+	if let Some( ( content_type, text ) ) = message {
 		stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
+		stream.write_all( ( format!( "Content-Length: {}\r\n", text.len() ) ).as_bytes() ).await?;
 	}
 	stream.write_all( b"WWW-Authenticate: Basic realm=\"Icy Server\"\r\n" ).await?;
 	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
@@ -882,9 +924,11 @@ fn default_property_server_id() -> String { SERVER_ID.to_string() }
 fn default_property_admin() -> String { ADMIN.to_string() }
 fn default_property_host() -> String { HOST.to_string() }
 fn default_property_location() -> String { LOCATION.to_string() }
-fn default_property_limits() -> ServerLimits { ServerLimits{ queue_size: default_property_limits_queue_size(), burst_size: default_property_limits_burst_size() } }
+fn default_property_limits() -> ServerLimits { ServerLimits{ queue_size: default_property_limits_queue_size(), burst_size: default_property_limits_burst_size(), header_timeout: default_property_limits_header_timeout(), source_timeout: default_property_limits_source_timeout() } }
 fn default_property_limits_queue_size() -> usize { QUEUE_SIZE }
 fn default_property_limits_burst_size() -> usize { BURST_SIZE }
+fn default_property_limits_header_timeout() -> u64 { HEADER_TIMEOUT }
+fn default_property_limits_source_timeout() -> u64 { SOURCE_TIMEOUT }
 
 #[ tokio::main ]
 async fn main() {
@@ -942,14 +986,16 @@ async fn main() {
 		Err( e ) => println!( "An error occured while to create the config file: {}", e ),
 	}
 	
-	println!( "Using PORT       : {}", properties.port );
-	println!( "Using METAINT    : {}", properties.metaint );
-	println!( "Using SERVER ID  : {}", properties.server_id );
-	println!( "Using ADMIN      : {}", properties.admin );
-	println!( "Using HOST       : {}", properties.host );
-	println!( "Using LOCATION   : {}", properties.location );
-	println!( "Using QUEUE SIZE : {}", properties.limits.queue_size );
-	println!( "Using BURST SIZE : {}", properties.limits.burst_size );
+	println!( "Using PORT           : {}", properties.port );
+	println!( "Using METAINT        : {}", properties.metaint );
+	println!( "Using SERVER ID      : {}", properties.server_id );
+	println!( "Using ADMIN          : {}", properties.admin );
+	println!( "Using HOST           : {}", properties.host );
+	println!( "Using LOCATION       : {}", properties.location );
+	println!( "Using QUEUE SIZE     : {}", properties.limits.queue_size );
+	println!( "Using BURST SIZE     : {}", properties.limits.burst_size );
+	println!( "Using HEADER TIMEOUT : {}", properties.limits.header_timeout );
+	println!( "Using SOURCE_TIMEOUT : {}", properties.limits.source_timeout );
 	
 	if properties.users.is_empty() {
 		println!( "At least one user must be configured in the config!" );
