@@ -207,7 +207,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 
 	let mut headers = [ httparse::EMPTY_HEADER; 16 ];
 	let mut req = httparse::Request::new( &mut headers );
-	let _offset = req.parse( &buf ).unwrap();
+	let body_offset = req.parse( &buf ).unwrap().unwrap();
 
 	let method = req.method.unwrap();
 	let ( base_path, queries ) = extract_queries( req.path.unwrap() );
@@ -217,44 +217,49 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 		server.read().await.properties.server_id.clone()
 	};
 	
-	if method == "SOURCE" {
-		// Check for authorization
-		if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
-			if !validate_user( &server.read().await.properties, name, pass ) {
-				send_unauthorized( &mut stream, server_id, None ).await?;
+	match method {
+		"SOURCE" => {
+			// Check for authorization
+			if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
+				if !validate_user( &server.read().await.properties, name, pass ) {
+					send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=urf-8", "Invalid credentials" ) ) ).await?;
+					return Ok( () )
+				}
+			} else {
+				// No auth, return and close
+				send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=urf-8", "You need to authenticate" ) ) ).await?;
 				return Ok( () )
 			}
-		} else {
-			// No auth, return and close
-			send_unauthorized( &mut stream, server_id, None ).await?;
-			return Ok( () )
-		}
-		
-		let path = {
-			// Remove the trailing '/'
-			if path.ends_with( '/' ) {
-				let mut chars = path.chars();
-				chars.next_back();
-				chars.collect()
-			} else {
-				path
+			
+			let path = {
+				// Remove the trailing '/'
+				if path.ends_with( '/' ) {
+					let mut chars = path.chars();
+					chars.next_back();
+					chars.collect()
+				} else {
+					path
+				}
+			};
+			
+			// Check if the path contains 'admin' or 'api'
+			if path == "/admin" ||
+					path.starts_with( "/admin/" ) ||
+					path == "/api" ||
+					path.starts_with( "/api/" ) {
+				send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
+				return Ok( () )
 			}
-		};
-		
-		// Check if the path contains 'admin' or 'api'
-		if path == "/admin" ||
-				path.starts_with( "/admin/" ) ||
-				path == "/api" ||
-				path.starts_with( "/api/" ) {
-			send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
-			return Ok( () )
-		}
-		
-		// Check if it is valid
-		let dir = Path::new( &path );
-		if let Some( parent ) = dir.parent() {
-			if let Some( parent_str ) = parent.to_str() {
-				if parent_str != "/" {
+			
+			// Check if it is valid
+			let dir = Path::new( &path );
+			if let Some( parent ) = dir.parent() {
+				if let Some( parent_str ) = parent.to_str() {
+					if parent_str != "/" {
+						send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
+						return Ok( () )
+					}
+				} else {
 					send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
 					return Ok( () )
 				}
@@ -262,335 +267,338 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
 				return Ok( () )
 			}
-		} else {
-			send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
-			return Ok( () )
-		}
-		
-		let mut properties = match get_header( "Content-Type", req.headers ) {
-			Some( content_type ) => IcyProperties::new( std::str::from_utf8( content_type ).unwrap().to_string() ),
-			None => {
-				send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "No Content-type given" ) ) ).await?;
+			
+			let mut properties = match get_header( "Content-Type", req.headers ) {
+				Some( content_type ) => IcyProperties::new( std::str::from_utf8( content_type ).unwrap().to_string() ),
+				None => {
+					send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "No Content-type given" ) ) ).await?;
+					return Ok( () )
+				}
+			};
+			
+			let mut serv = server.write().await;
+			// Check if the mountpoint is already in use
+			if serv.sources.contains_key( &path ) {
+				send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
 				return Ok( () )
 			}
-		};
-		
-		let mut serv = server.write().await;
-		// Check if the mountpoint is already in use
-		if serv.sources.contains_key( &path ) {
-			send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
-			return Ok( () )
-		}
-		
-		// Give an 200 OK response
-		send_ok( &mut stream, server_id, None ).await?;
-		
-		// Parse the headers for the source properties
-		populate_properties( &mut properties, req.headers );
-		
-		// Create the source
-		let source = Source {
-			mountpoint: path.clone(),
-			properties,
-			metadata: None,
-			metadata_vec: vec![ 0 ],
-			clients: HashMap::new(),
-			burst_buffer: Vec::new()
-		};
-		
-		let queue_size = serv.properties.limits.queue_size;
-		let burst_size = serv.properties.limits.burst_size;
-		
-		// Add to the server
-		let arc = Arc::new( RwLock::new( source ) );
-		serv.sources.insert( path.clone(), arc.clone() );
-		let source_timeout = serv.properties.limits.header_timeout;
-		drop( serv );
-		
-		println!( "Mounted source on {}", path );
-		
-		// TODO Broadcast bytes that might have been sent with the header
-		
-		// Listen for bytes
-		while {
-			// Read the incoming stream data until it closes
-			let mut buf = [ 0; 1024 ];
-			let read = match timeout( Duration::from_millis( source_timeout ), async {
-				match stream.read( &mut buf ).await {
+			
+			// Give an 200 OK response
+			send_ok( &mut stream, server_id, None ).await?;
+			
+			// Parse the headers for the source properties
+			populate_properties( &mut properties, req.headers );
+			
+			// Create the source
+			let source = Source {
+				mountpoint: path.clone(),
+				properties,
+				metadata: None,
+				metadata_vec: vec![ 0 ],
+				clients: HashMap::new(),
+				burst_buffer: Vec::new()
+			};
+			
+			let queue_size = serv.properties.limits.queue_size;
+			let burst_size = serv.properties.limits.burst_size;
+			
+			// Add to the server
+			let arc = Arc::new( RwLock::new( source ) );
+			serv.sources.insert( path.clone(), arc.clone() );
+			let source_timeout = serv.properties.limits.header_timeout;
+			drop( serv );
+			
+			println!( "Mounted source on {}", path );
+			
+			if buf.len() < body_offset {
+				let slice = &buf[ body_offset .. ];
+				broadcast_to_clients( &arc, slice.to_vec(), queue_size, burst_size ).await;
+			}
+			
+			// Listen for bytes
+			while {
+				// Read the incoming stream data until it closes
+				let mut buf = [ 0; 1024 ];
+				let read = match timeout( Duration::from_millis( source_timeout ), async {
+					match stream.read( &mut buf ).await {
+						Ok( n ) => n,
+						Err( e ) => {
+							println!( "An error occured while reading stream data: {}", e );
+							0
+						}
+					}
+				} ).await {
 					Ok( n ) => n,
-					Err( e ) => {
-						println!( "An error occured while reading stream data: {}", e );
+					Err( _ ) => {
+						println!( "A source timed out: {}", path );
 						0
 					}
-				}
-			} ).await {
-				Ok( n ) => n,
-				Err( _ ) => {
-					println!( "A source timed out: {}", path );
-					0
-				}
-			};
-			
-			if read != 0 {
-				// Get the slice
-				let mut slice: Vec< u8 > = Vec::new();
-				slice.extend_from_slice( &buf[ .. read  ] );
+				};
 				
-				broadcast_to_clients( &arc, slice, queue_size, burst_size ).await;
-			}
-			
-			read != 0
-		}  {}
-		
-		// Clean up and remove the source
-		let mut serv = server.write().await;
-		// TODO Add a fallback mount
-		for cli in arc.read().await.clients.values() {
-			// Send an empty vec to signify the channel is closed
-			drop( cli.read().await.sender.write().await.send( Arc::new( Vec::new() ) ) );
-		}
-		
-		serv.sources.remove( &path );
-		println!( "Unmounted source {}", path );
-	} else if method == "PUT" {
-		// TODO Implement the PUT method
-		// For now, return a 405
-		stream.write_all( b"HTTP/1.0 405 Method Not Allowed\r\n" ).await?;
-		stream.write_all( ( format!( "Server: {}\r\n", server_id ) ).as_bytes() ).await?;
-		stream.write_all( b"Connection: Close\r\n" ).await?;
-		stream.write_all( b"Allow: GET, SOURCE\r\n" ).await?;
-		stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
-		stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
-		stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
-		stream.write_all( b"Pragma: no-cache\r\n\r\n" ).await?;
-		stream.write_all( b"Access-Control-Allow-Origin: *\r\n" ).await?;
-	} else if method == "GET" {
-		let source_id = path.to_owned();
-		let source_id = {
-			// Remove the trailing '/'
-			if source_id.ends_with( '/' ) {
-				let mut chars = source_id.chars();
-				chars.next_back();
-				chars.collect()
-			} else {
-				source_id
-			}
-		};
-		
-		let mut serv = server.write().await;
-		let source_option = serv.sources.get( &source_id );
-		// Check if the source is valid
-		if let Some( source_lock ) = source_option {
-			let mut source = source_lock.write().await;
-			
-			// Reply with a 200 OK
-			send_listener_ok( &mut stream, server_id, &source.properties, serv.properties.metaint ).await?;
-			
-			// Create a client
-			// Check if metadata is enabled
-			let meta_enabled = get_header( "Icy-MetaData", req.headers ).unwrap_or( b"0" ) == b"1";
-			// Get a valid UUID
-			let client_id = {
-				let mut unique = Uuid::new_v4();
-				// Hopefully this doesn't take until the end of time
-				while serv.clients.contains_key( &unique ) {
-					unique = Uuid::new_v4();
+				if read != 0 {
+					// Get the slice
+					let mut slice: Vec< u8 > = Vec::new();
+					slice.extend_from_slice( &buf[ .. read  ] );
+					
+					broadcast_to_clients( &arc, slice, queue_size, burst_size ).await;
 				}
-				unique
+				
+				read != 0
+			}  {}
+			
+			// Clean up and remove the source
+			let mut serv = server.write().await;
+			// TODO Add a fallback mount
+			for cli in arc.read().await.clients.values() {
+				// Send an empty vec to signify the channel is closed
+				drop( cli.read().await.sender.write().await.send( Arc::new( Vec::new() ) ) );
+			}
+			
+			serv.sources.remove( &path );
+			println!( "Unmounted source {}", path );
+		}
+		"PUT" => {
+			// TODO Implement the PUT method
+			// For now, return a 405
+			stream.write_all( b"HTTP/1.0 405 Method Not Allowed\r\n" ).await?;
+			stream.write_all( ( format!( "Server: {}\r\n", server_id ) ).as_bytes() ).await?;
+			stream.write_all( b"Connection: Close\r\n" ).await?;
+			stream.write_all( b"Allow: GET, SOURCE\r\n" ).await?;
+			stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
+			stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
+			stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
+			stream.write_all( b"Pragma: no-cache\r\n\r\n" ).await?;
+			stream.write_all( b"Access-Control-Allow-Origin: *\r\n" ).await?;
+		}
+		"GET" => {
+			let source_id = path.to_owned();
+			let source_id = {
+				// Remove the trailing '/'
+				if source_id.ends_with( '/' ) {
+					let mut chars = source_id.chars();
+					chars.next_back();
+					chars.collect()
+				} else {
+					source_id
+				}
 			};
-
-			let ( sender, receiver ) = unbounded_channel::< Arc< Vec< u8 > > >();
-			let properties = ClientProperties {
-				id: client_id,
-				uagent: {
-					if let Some( arr ) = get_header( "User-Agent", req.headers ) {
-						if let Ok( parsed ) = std::str::from_utf8( arr ) {
-							Some( parsed.to_string() )
+			
+			let mut serv = server.write().await;
+			let source_option = serv.sources.get( &source_id );
+			// Check if the source is valid
+			if let Some( source_lock ) = source_option {
+				let mut source = source_lock.write().await;
+				
+				// Reply with a 200 OK
+				send_listener_ok( &mut stream, server_id, &source.properties, serv.properties.metaint ).await?;
+				
+				// Create a client
+				// Check if metadata is enabled
+				let meta_enabled = get_header( "Icy-MetaData", req.headers ).unwrap_or( b"0" ) == b"1";
+				// Get a valid UUID
+				let client_id = {
+					let mut unique = Uuid::new_v4();
+					// Hopefully this doesn't take until the end of time
+					while serv.clients.contains_key( &unique ) {
+						unique = Uuid::new_v4();
+					}
+					unique
+				};
+	
+				let ( sender, receiver ) = unbounded_channel::< Arc< Vec< u8 > > >();
+				let properties = ClientProperties {
+					id: client_id,
+					uagent: {
+						if let Some( arr ) = get_header( "User-Agent", req.headers ) {
+							if let Ok( parsed ) = std::str::from_utf8( arr ) {
+								Some( parsed.to_string() )
+							} else {
+								None
+							}
 						} else {
 							None
 						}
-					} else {
-						None
-					}
-				},
-				metadata: meta_enabled
-			};
-			let client = Client {
-				sender: RwLock::new( sender ),
-				receiver: RwLock::new( receiver ),
-				buffer_size: RwLock::new( 0 ),
-				properties: properties.clone()
-			};
-
-			
-			if let Some( agent ) = &client.properties.uagent {
-				println!( "User {} started listening on {} with user-agent {}", client_id, source_id, agent );
-			} else {
-				println!( "User {} started listening on {}", client_id, source_id );
-			}
-			if meta_enabled {
-				println!( "User {} has icy metadata enabled", client_id );
-			}
-			
-			// Get the metaint
-			let metalen = serv.properties.metaint;
-			// Add our client
-			// The map with an id may be unnecessary, but oh well
-			// That can be removed later
-			
-			let arc_client = Arc::new( RwLock::new( client ) );
-			
-			// Keep track of how many bytes have been sent
-			let mut sent_count = 0;
-			// Send the burst on connect buffer
-			let burst_buf = &source.burst_buffer;
-			if !burst_buf.is_empty() {
-				match {
-					if meta_enabled {
-						let meta_vec = source.metadata_vec.clone();
-						write_to_client( &mut stream, &mut sent_count, metalen, burst_buf, &meta_vec ).await
-					} else {
-						stream.write_all( &burst_buf ).await
-					}
-				} {
-					Ok( _ ) => (),
-					Err( e ) if e.kind() == ErrorKind::ConnectionReset || e.kind() == ErrorKind::ConnectionAborted => (),
-					Err( e ) => {
-						println!( "An error occured while sending the burst on connect buffer: {}", e );
-						return Ok( () )
-					}
-				}
-			}
-			
-			// Add the client id to the list of clients attached to the source
-			source.clients.insert( client_id, arc_client.clone() );
-			// No more need for source
-			drop( source );
-			serv.clients.insert( client_id, properties );
-			drop( serv );
-			
-			loop {
-				// Receive whatever bytes, then send to the client
-				let client = arc_client.read().await;
-				let mut queue = client.receiver.write().await;
-				let res = queue.recv().await;
-				// Check if the bus is still alive
-				if let Some( read ) = res {
-					// If an empty buffer has been sent, then disconnect the client
-					if read.len() > 0 {
-						*client.buffer_size.write().await -= read.len();
-						match {
-							if meta_enabled {
-								let meta_vec = {
-									let serv = server.read().await;
-									if let Some( source_lock ) = serv.sources.get( &source_id ) {
-										let source = source_lock.read().await;
-										
-										source.metadata_vec.clone()
-									} else {
-										vec![ 0 ]
-									}
-								};
-								
-								write_to_client( &mut stream, &mut sent_count, metalen, &read.to_vec(), &meta_vec ).await
-							} else {
-								stream.write_all( &read.to_vec() ).await
-							}
-						} {
-							Ok( _ ) => (),
-							Err( e ) if e.kind() == ErrorKind::ConnectionReset || e.kind() == ErrorKind::ConnectionAborted => break,
-							Err( e ) => {
-								println!( "An error occured while streaming: {}", e );
-								break
-							}
-						}
-					} else {
-						break;
-					}
+					},
+					metadata: meta_enabled
+				};
+				let client = Client {
+					sender: RwLock::new( sender ),
+					receiver: RwLock::new( receiver ),
+					buffer_size: RwLock::new( 0 ),
+					properties: properties.clone()
+				};
+	
+				
+				if let Some( agent ) = &client.properties.uagent {
+					println!( "User {} started listening on {} with user-agent {}", client_id, source_id, agent );
 				} else {
-					// The sender has been dropped
-					// The listener has been kicked
-					println!( "The sender has been dropped!" );
-					break;
+					println!( "User {} started listening on {}", client_id, source_id );
 				}
-			}
-			
-			// Close the message queue
-			arc_client.read().await.receiver.write().await.close();
-			
-			println!( "User {} has disconnected", client_id );
-			
-			let mut serv = server.write().await;
-			// Remove the client information from the list of clients
-			serv.clients.remove( &client_id );
-			drop( serv );
-		} else {
-			// Figure out what the request wants
-			// /admin/metadata for updating the metadata
-			// Anything else is not vanilla
-			// Return a 404 otherwise
-			
-			match path.as_str() {
-				"/admin/metadata" => {
-					// Check for authorization
-					if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
-						// For testing purposes right now
-						// TODO Add proper configuration
-						if !validate_user( &serv.properties, name, pass ) {
-							send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
+				if meta_enabled {
+					println!( "User {} has icy metadata enabled", client_id );
+				}
+				
+				// Get the metaint
+				let metalen = serv.properties.metaint;
+				// Add our client
+				// The map with an id may be unnecessary, but oh well
+				// That can be removed later
+				
+				let arc_client = Arc::new( RwLock::new( client ) );
+				
+				// Keep track of how many bytes have been sent
+				let mut sent_count = 0;
+				// Send the burst on connect buffer
+				let burst_buf = &source.burst_buffer;
+				if !burst_buf.is_empty() {
+					match {
+						if meta_enabled {
+							let meta_vec = source.metadata_vec.clone();
+							write_to_client( &mut stream, &mut sent_count, metalen, burst_buf, &meta_vec ).await
+						} else {
+							stream.write_all( &burst_buf ).await
+						}
+					} {
+						Ok( _ ) => (),
+						Err( e ) if e.kind() == ErrorKind::ConnectionReset || e.kind() == ErrorKind::ConnectionAborted => (),
+						Err( e ) => {
+							println!( "An error occured while sending the burst on connect buffer: {}", e );
 							return Ok( () )
 						}
-					} else {
-						// No auth, return and close
-						send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
-						return Ok( () )
-					}
-					
-					// Authentication passed
-					// Now check the query fields
-					// Takes in mode, mount, song and url
-					if let Some( queries ) = queries {
-						match get_queries_for( vec![ "mode", "mount", "song", "url" ], &queries )[ .. ].as_ref() {
-							[ Some( mode ), Some( mount ), song, url ] if mode == "updinfo" => {
-								match serv.sources.get( mount ) {
-									Some( source ) => {
-										println!( "Updated source {} metadata with title '{}' and url '{}'", mount, song.as_ref().unwrap_or( &"".to_string() ), url.as_ref().unwrap_or( &"".to_string() ) );
-										let mut source = source.write().await;
-										source.metadata = match ( song, url ) {
-											( None, None ) => None,
-											_ => Some( IcyMetadata {
-												title: song.clone(),
-												url: url.clone()
-											} ),
-										};
-										source.metadata_vec = get_metadata_vec( &source.metadata );
-										send_ok( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Success" ) ) ).await?;
-									}
-									None => send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?,
-								}
-							}
-							_ => (),
-						}
-					} else {
-						// Bad request
-						send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
 					}
 				}
-				// Return 404
-				_ => send_not_found( &mut stream, server_id, Some( ( "text/html; charset=utf-8", "<html><head><title>Error 404</title></head><body><b>404 - The file you requested could not be found</b></body></html>" ) ) ).await?,
+				
+				// Add the client id to the list of clients attached to the source
+				source.clients.insert( client_id, arc_client.clone() );
+				// No more need for source
+				drop( source );
+				serv.clients.insert( client_id, properties );
+				drop( serv );
+				
+				loop {
+					// Receive whatever bytes, then send to the client
+					let client = arc_client.read().await;
+					let mut queue = client.receiver.write().await;
+					let res = queue.recv().await;
+					// Check if the bus is still alive
+					if let Some( read ) = res {
+						// If an empty buffer has been sent, then disconnect the client
+						if read.len() > 0 {
+							*client.buffer_size.write().await -= read.len();
+							match {
+								if meta_enabled {
+									let meta_vec = {
+										let serv = server.read().await;
+										if let Some( source_lock ) = serv.sources.get( &source_id ) {
+											let source = source_lock.read().await;
+											
+											source.metadata_vec.clone()
+										} else {
+											vec![ 0 ]
+										}
+									};
+									
+									write_to_client( &mut stream, &mut sent_count, metalen, &read.to_vec(), &meta_vec ).await
+								} else {
+									stream.write_all( &read.to_vec() ).await
+								}
+							} {
+								Ok( _ ) => (),
+								Err( e ) if e.kind() == ErrorKind::ConnectionReset || e.kind() == ErrorKind::ConnectionAborted => break,
+								Err( e ) => {
+									println!( "An error occured while streaming: {}", e );
+									break
+								}
+							}
+						} else {
+							break;
+						}
+					} else {
+						// The sender has been dropped
+						// The listener has been kicked
+						println!( "The sender has been dropped!" );
+						break;
+					}
+				}
+				
+				// Close the message queue
+				arc_client.read().await.receiver.write().await.close();
+				
+				println!( "User {} has disconnected", client_id );
+				
+				let mut serv = server.write().await;
+				// Remove the client information from the list of clients
+				serv.clients.remove( &client_id );
+				drop( serv );
+			} else {
+				// Figure out what the request wants
+				// /admin/metadata for updating the metadata
+				// Anything else is not vanilla
+				// Return a 404 otherwise
+				
+				match path.as_str() {
+					"/admin/metadata" => {
+						// Check for authorization
+						if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
+							// For testing purposes right now
+							// TODO Add proper configuration
+							if !validate_user( &serv.properties, name, pass ) {
+								send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
+								return Ok( () )
+							}
+						} else {
+							// No auth, return and close
+							send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
+							return Ok( () )
+						}
+						
+						// Authentication passed
+						// Now check the query fields
+						// Takes in mode, mount, song and url
+						if let Some( queries ) = queries {
+							match get_queries_for( vec![ "mode", "mount", "song", "url" ], &queries )[ .. ].as_ref() {
+								[ Some( mode ), Some( mount ), song, url ] if mode == "updinfo" => {
+									match serv.sources.get( mount ) {
+										Some( source ) => {
+											println!( "Updated source {} metadata with title '{}' and url '{}'", mount, song.as_ref().unwrap_or( &"".to_string() ), url.as_ref().unwrap_or( &"".to_string() ) );
+											let mut source = source.write().await;
+											source.metadata = match ( song, url ) {
+												( None, None ) => None,
+												_ => Some( IcyMetadata {
+													title: song.clone(),
+													url: url.clone()
+												} ),
+											};
+											source.metadata_vec = get_metadata_vec( &source.metadata );
+											send_ok( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Success" ) ) ).await?;
+										}
+										None => send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?,
+									}
+								}
+								_ => (),
+							}
+						} else {
+							// Bad request
+							send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
+						}
+					}
+					// Return 404
+					_ => send_not_found( &mut stream, server_id, Some( ( "text/html; charset=utf-8", "<html><head><title>Error 404</title></head><body><b>404 - The file you requested could not be found</b></body></html>" ) ) ).await?,
+				}
 			}
 		}
-	} else {
-		// Unknown
-		stream.write_all( b"HTTP/1.0 405 Method Not Allowed\r\n" ).await?;
-		stream.write_all( ( format!( "Server: {}\r\n", server_id ) ).as_bytes() ).await?;
-		stream.write_all( b"Connection: Close\r\n" ).await?;
-		stream.write_all( b"Allow: GET, SOURCE\r\n" ).await?;
-		stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
-		stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
-		stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
-		stream.write_all( b"Pragma: no-cache\r\n\r\n" ).await?;
-		stream.write_all( b"Access-Control-Allow-Origin: *\r\n" ).await?;
+		_ => {
+			// Unknown
+			stream.write_all( b"HTTP/1.0 405 Method Not Allowed\r\n" ).await?;
+			stream.write_all( ( format!( "Server: {}\r\n", server_id ) ).as_bytes() ).await?;
+			stream.write_all( b"Connection: Close\r\n" ).await?;
+			stream.write_all( b"Allow: GET, SOURCE\r\n" ).await?;
+			stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
+			stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
+			stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
+			stream.write_all( b"Pragma: no-cache\r\n\r\n" ).await?;
+			stream.write_all( b"Access-Control-Allow-Origin: *\r\n" ).await?;
+		}
 	}
 	
 	Ok( () )
