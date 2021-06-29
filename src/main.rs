@@ -1,7 +1,7 @@
 use httpdate::fmt_http_date;
 use regex::Regex;
 use serde::{ Deserialize, Serialize };
-use std::collections::{ HashMap };
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
 use std::io::{ BufWriter, ErrorKind, Write };
@@ -23,6 +23,9 @@ const SERVER_ID: &str = "Rusty Zenith 0.1.0";
 const ADMIN: &str = "admin@localhost";
 const HOST: &str = "localhost";
 const LOCATION: &str = "1.048596";
+
+const QUEUE_SIZE: usize = 102400;
+const BURST_SIZE: usize = 65536;
 
 #[ derive( Clone ) ]
 struct Query {
@@ -84,7 +87,8 @@ struct Source {
 	properties: IcyProperties,
 	metadata: Option< IcyMetadata >,
 	metadata_vec: Vec< u8 >,
-	clients: HashMap< Uuid, Arc< RwLock< Client > > >
+	clients: HashMap< Uuid, Arc< RwLock< Client > > >,
+	burst_buffer: Vec< u8 >
 }
 
 // TODO Add permissions
@@ -92,6 +96,14 @@ struct Source {
 struct Credential {
 	username: String,
 	password: String
+}
+
+#[ derive( Serialize, Deserialize, Copy, Clone ) ]
+struct ServerLimits {
+	#[ serde( default = "default_property_limits_queue_size" ) ]
+	queue_size: usize,
+	#[ serde( default = "default_property_limits_burst_size" ) ]
+	burst_size: usize
 }
 
 #[ derive( Serialize, Deserialize, Clone ) ]
@@ -108,18 +120,21 @@ struct ServerProperties {
 	host: String,
 	#[ serde( default = "default_property_location" ) ]
 	location: String,
+	#[ serde( default = "default_property_limits" ) ]
+	limits: ServerLimits,
 	users: Vec< Credential >
 }
 
 impl ServerProperties {
 	fn new() -> ServerProperties {
 		ServerProperties {
-			port: PORT,
-			metaint: METAINT,
-			server_id: SERVER_ID.to_string(),
-			admin: ADMIN.to_string(),
-			host: HOST.to_string(),
-			location: LOCATION.to_string(),
+			port: default_property_port(),
+			metaint: default_property_metaint(),
+			server_id: default_property_server_id(),
+			admin: default_property_admin(),
+			host: default_property_host(),
+			location: default_property_location(),
+			limits: default_property_limits(),
 			users: Vec::new()
 		}
 	}
@@ -147,6 +162,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 	let mut buffer = [ 0; 512 ];
 	
 	// Get the header
+	// TODO Add a timeout
 	while {
 		let mut headers = [ httparse::EMPTY_HEADER; 16 ];
 		let mut req = httparse::Request::new( &mut headers );
@@ -154,11 +170,17 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			Ok( read ) => buf.extend_from_slice( &buffer[ .. read ] ),
 			Err( e ) => {
 				println!( "An error occured while reading a request: {}", e );
-				return Err( Box::new( e ) );
+				return Ok( () )
 			}
 		}
 		
-		req.parse( &buf )?.is_partial()
+		match req.parse( &buf ) {
+			Ok( res ) => res.is_partial(),
+			Err( e ) => {
+				println!( "An error occured while parsing a request: {}", e );
+				return Ok( () )
+			}
+		}
 	} {}
 
 	let mut headers = [ httparse::EMPTY_HEADER; 16 ];
@@ -250,8 +272,12 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			properties,
 			metadata: None,
 			metadata_vec: vec![ 0 ],
-			clients: HashMap::new()
+			clients: HashMap::new(),
+			burst_buffer: Vec::new()
 		};
+		
+		let queue_size = serv.properties.limits.queue_size;
+		let burst_size = serv.properties.limits.burst_size;
 		
 		// Add to the server
 		let arc = Arc::new( RwLock::new( source ) );
@@ -264,6 +290,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 		while {
 			// Read the incoming stream data until it closes
 			let mut buf = [ 0; 1024 ];
+			// TODO Add a timeout
 			let read = match stream.read( &mut buf ).await {
 				Ok( n ) => n,
 				Err( e ) => {
@@ -282,20 +309,31 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				// Remove these later
 				let mut dropped: Vec< Uuid > = Vec::new();
 				
+				let mut locked = arc.write().await;
+				
 				// Broadcast to all listeners
-				for ( uuid, cli ) in &arc.write().await.clients {
+				for ( uuid, cli ) in &locked.clients {
 					let client = cli.read().await;
 					let mut buf_size = client.buffer_size.write().await;
 					let queue = client.sender.write().await;
-					if read + ( *buf_size ) > 102400 || queue.send( arc_slice.clone() ).is_err() {
+					if read + ( *buf_size ) > queue_size || queue.send( arc_slice.clone() ).is_err() {
 						dropped.push( *uuid );
 					} else {
 						( *buf_size ) += read;
 					}
 				}
 				
+				// Fill the burst on connect buffer
+				if burst_size > 0 {
+					let burst_buf = &mut locked.burst_buffer;
+					burst_buf.extend_from_slice( &arc_slice );
+					// Trim it if it's larger than the allowed size
+					if burst_buf.len() > burst_size {
+						burst_buf.drain( .. burst_buf.len() - burst_size );
+					}
+				}
+				
 				// Remove clients who have been kicked or disconnected
-				let mut locked = arc.write().await;
 				for uuid in dropped {
 					if let Some( client ) = locked.clients.remove( &uuid ) {
 						drop( client.read().await.sender.write().await.send( Arc::new( Vec::new() ) ) );
@@ -403,17 +441,36 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			// That can be removed later
 			
 			let arc_client = Arc::new( RwLock::new( client ) );
+			
+			// Keep track of how many bytes have been sent
+			let mut sent_count = 0;
+			// Send the burst on connect buffer
+			let burst_buf = &source.burst_buffer;
+			if !burst_buf.is_empty() {
+				match {
+					if meta_enabled {
+						let meta_vec = source.metadata_vec.clone();
+						write_to_client( &mut stream, &mut sent_count, metalen, burst_buf, &meta_vec ).await
+					} else {
+						stream.write_all( &burst_buf ).await
+					}
+				} {
+					Ok( _ ) => (),
+					Err( e ) if e.kind() == ErrorKind::ConnectionReset || e.kind() == ErrorKind::ConnectionAborted => (),
+					Err( e ) => {
+						println!( "An error occured while sending the burst on connect buffer: {}", e );
+						return Ok( () )
+					}
+				}
+			}
+			
 			// Add the client id to the list of clients attached to the source
 			source.clients.insert( client_id, arc_client.clone() );
 			// No more need for source
 			drop( source );
-			// TODO Use IDs instead
 			serv.clients.insert( client_id, properties );
 			drop( serv );
 			
-			// TODO Add bursting
-			
-			let mut sent_count = 0;
 			loop {
 				// Receive whatever bytes, then send to the client
 				let client = arc_client.read().await;
@@ -437,23 +494,13 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 									}
 								};
 								
-								// When writing to the client, there is a chance that the buffer is full and blocks
-								// This could cause the bus to fill up, and starve all the clients listening
-								// Ideally, have 2 threads, where one fills a buffer
-								// And the other empties it
-								// If the buffer is full, then kick the listener
-								// Would using a bus make any difference then?
-								// The alternative would be to keep track of each client
-								// and write to their queue whenever possible
-								// The client doesn't know which source it belongs to though
-								// It would need an internal flag to signify that it's been closed
 								write_to_client( &mut stream, &mut sent_count, metalen, &read.to_vec(), &meta_vec ).await
 							} else {
 								stream.write_all( &read.to_vec() ).await
 							}
 						} {
 							Ok( _ ) => (),
-							Err( e ) if e.kind() == ErrorKind::ConnectionReset => break,
+							Err( e ) if e.kind() == ErrorKind::ConnectionReset || e.kind() == ErrorKind::ConnectionAborted => break,
 							Err( e ) => {
 								println!( "An error occured while streaming: {}", e );
 								break
@@ -627,7 +674,6 @@ async fn send_not_found( stream: &mut TcpStream, id: String, message: Option< ( 
 	if let Some( ( _, text ) ) = message {
 		stream.write_all( text.as_bytes() ).await?;
 	}
-//	stream.write_all( b"<html><head><title>Error 404</title></head><body><b>404 - The file you requested could not be found</b></body></html>\r\n" ).await?;
 	
 	Ok( () )
 }
@@ -836,6 +882,9 @@ fn default_property_server_id() -> String { SERVER_ID.to_string() }
 fn default_property_admin() -> String { ADMIN.to_string() }
 fn default_property_host() -> String { HOST.to_string() }
 fn default_property_location() -> String { LOCATION.to_string() }
+fn default_property_limits() -> ServerLimits { ServerLimits{ queue_size: default_property_limits_queue_size(), burst_size: default_property_limits_burst_size() } }
+fn default_property_limits_queue_size() -> usize { QUEUE_SIZE }
+fn default_property_limits_burst_size() -> usize { BURST_SIZE }
 
 #[ tokio::main ]
 async fn main() {
@@ -872,24 +921,26 @@ async fn main() {
 			}
 		}
 		Err( e ) if e.kind() == std::io::ErrorKind::NotFound => {
-			println!( "Attempting to save the config to file" );
-			match File::create( &config_location ) {
-				Ok( file ) => {
-					match serde_json::to_string_pretty( &properties ) {
-						Ok( config ) => {
-							let mut writer = BufWriter::new( file );
-							if let Err( e ) = writer.write_all( config.as_bytes() ) {
-								println!( "An error occured while writing to the config file: {}", e );
-							}
-						}
-						Err( e ) => println!( "An error occured while trying to serialize the server properties: {}", e ),
-					}
-				}
-				Err( e ) => println!( "An error occured while to create the config file: {}", e ),
-			}
+			println!( "The config file was not found! Attempting to save to file" );
 		}
 		Err( e ) => println!( "An error occured while trying to read the config: {}", e ),
-	};
+	}
+	
+	// Create or update the current config
+	match File::create( &config_location ) {
+		Ok( file ) => {
+			match serde_json::to_string_pretty( &properties ) {
+				Ok( config ) => {
+					let mut writer = BufWriter::new( file );
+					if let Err( e ) = writer.write_all( config.as_bytes() ) {
+						println!( "An error occured while writing to the config file: {}", e );
+					}
+				}
+				Err( e ) => println!( "An error occured while trying to serialize the server properties: {}", e ),
+			}
+		}
+		Err( e ) => println!( "An error occured while to create the config file: {}", e ),
+	}
 	
 	println!( "Using PORT       : {}", properties.port );
 	println!( "Using METAINT    : {}", properties.metaint );
@@ -897,6 +948,8 @@ async fn main() {
 	println!( "Using ADMIN      : {}", properties.admin );
 	println!( "Using HOST       : {}", properties.host );
 	println!( "Using LOCATION   : {}", properties.location );
+	println!( "Using QUEUE SIZE : {}", properties.limits.queue_size );
+	println!( "Using BURST SIZE : {}", properties.limits.burst_size );
 	
 	if properties.users.is_empty() {
 		println!( "At least one user must be configured in the config!" );
