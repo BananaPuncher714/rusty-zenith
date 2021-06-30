@@ -18,13 +18,15 @@ This program was created to allow updating and sending of a stream url in the ic
   
 ```json
 {
-  "port": 1900,
+  "port": 8000,
   "metaint": 16000,
   "server_id": "Rusty Zenith 0.1.0",
   "admin": "admin@localhost",
   "host": "localhost",
   "location": "1.048596",
   "limits": {
+    "clients": 400,
+    "sources": 4,
     "queue_size": 102400,
     "burst_size": 65536,
     "header_timeout": 15000,
@@ -51,6 +53,8 @@ This program was created to allow updating and sending of a stream url in the ic
 - `admin`: The contact information for the server
 - `host`: Public facing domain/url
 - `location`: Geographic location
+- `limits.clients`: Maximum number of concurrent listeners supported by the server. Does not include static accesses, such as requests to gather stats. This is the max number of listeners for the entire server, not per mountpoint.
+- `limit.sources`: Maximum number of connected sources supported by the server.
 - `limits.queue_size`: **(Taken from the Icecast docs)**
   > This is the maximum size (in bytes) of a client (listener) queue. A listener may temporarily lag behind due to network congestion and in this case an internal queue is maintained for each listener. If the queue grows larger than this config value, then the listener will be removed from the stream.
 
@@ -72,3 +76,6 @@ This program was created to allow updating and sending of a stream url in the ic
 - Implement the PUT request
 - Add a fallback mount
 - Add a permission system for users
+- Add a separate base directory for streams
+- Add per-mountpoint settings
+- Add a relay system?

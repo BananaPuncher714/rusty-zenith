@@ -17,7 +17,7 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 // Default constants
-const PORT: u16 = 1900;
+const PORT: u16 = 8000;
 // The default interval in bytes between icy metadata chunks
 // The metaint cannot be changed per client once the response has been sent
 // https://thecodeartist.blogspot.com/2013/02/shoutcast-internet-radio-protocol.html
@@ -31,6 +31,10 @@ const HOST: &str = "localhost";
 // Geographic location. Icecast included it in their settings, so why not
 const LOCATION: &str = "1.048596";
 
+// How many sources can be connected, in total
+const SOURCES: usize = 4;
+// How many clients can be connected, in total
+const CLIENTS: usize = 400;
 // How many bytes a client can have queued until they get disconnected
 const QUEUE_SIZE: usize = 102400;
 // How many bytes to send to the client all at once when they first connect
@@ -114,6 +118,10 @@ struct Credential {
 
 #[ derive( Serialize, Deserialize, Copy, Clone ) ]
 struct ServerLimits {
+	#[ serde( default = "default_property_limits_clients" ) ]
+	clients: usize,
+	#[ serde( default = "default_property_limits_sources" ) ]
+	sources: usize,
 	#[ serde( default = "default_property_limits_queue_size" ) ]
 	queue_size: usize,
 	#[ serde( default = "default_property_limits_burst_size" ) ]
@@ -287,6 +295,8 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				return Ok( () )
 			}
 			
+			// Sources must have a content type
+			// Maybe the type that is served should be checked?
 			let mut properties = match get_header( "Content-Type", req.headers ) {
 				Some( content_type ) => IcyProperties::new( std::str::from_utf8( content_type ).unwrap().to_string() ),
 				None => {
@@ -299,6 +309,12 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			// Check if the mountpoint is already in use
 			if serv.sources.contains_key( &path ) {
 				send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
+				return Ok( () )
+			}
+			
+			// Check if the max number of sources has been reached
+			if serv.sources.len() > serv.properties.limits.sources {
+				send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Too many sources connected" ) ) ).await?;
 				return Ok( () )
 			}
 			
@@ -409,6 +425,12 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			// Check if the source is valid
 			if let Some( source_lock ) = source_option {
 				let mut source = source_lock.write().await;
+				
+				// Check if the max number of listeners has been reached
+				if serv.clients.len() > serv.properties.limits.clients {
+					send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Too many listeners connected" ) ) ).await?;
+					return Ok( () )
+				}
 				
 				// Reply with a 200 OK
 				send_listener_ok( &mut stream, server_id, &source.properties, serv.properties.metaint ).await?;
@@ -955,7 +977,16 @@ fn default_property_admin() -> String { ADMIN.to_string() }
 fn default_property_host() -> String { HOST.to_string() }
 fn default_property_location() -> String { LOCATION.to_string() }
 fn default_property_users() -> Vec< Credential > { vec![ Credential{ username: "admin".to_string(), password: "hackme".to_string() }, Credential { username: "source".to_string(), password: "hackme".to_string() } ] }
-fn default_property_limits() -> ServerLimits { ServerLimits{ queue_size: default_property_limits_queue_size(), burst_size: default_property_limits_burst_size(), header_timeout: default_property_limits_header_timeout(), source_timeout: default_property_limits_source_timeout() } }
+fn default_property_limits() -> ServerLimits { ServerLimits{
+	clients: default_property_limits_clients(),
+	sources: default_property_limits_sources(),
+	queue_size: default_property_limits_queue_size(),
+	burst_size: default_property_limits_burst_size(),
+	header_timeout: default_property_limits_header_timeout(),
+	source_timeout: default_property_limits_source_timeout()
+} }
+fn default_property_limits_clients() -> usize { CLIENTS }
+fn default_property_limits_sources() -> usize { SOURCES }
 fn default_property_limits_queue_size() -> usize { QUEUE_SIZE }
 fn default_property_limits_burst_size() -> usize { BURST_SIZE }
 fn default_property_limits_header_timeout() -> u64 { HEADER_TIMEOUT }
