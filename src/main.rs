@@ -731,7 +731,12 @@ async fn send_listener_ok( stream: &mut TcpStream, id: String, properties: &IcyP
 	stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
 	stream.write_all( b"Pragma: no-cache\r\n" ).await?;
 	stream.write_all( b"Access-Control-Allow-Origin: *\r\n" ).await?;
-	
+
+	// If metaint is enabled
+	if meta_enabled {
+		stream.write_all( ( format!( "icy-metaint:{}\r\n", metaint ) ).as_bytes() ).await?;
+	}
+
 	// Properties or default
 	if let Some( br ) = properties.bitrate.as_ref() {
 		stream.write_all( ( format!( "icy-br:{}\r\n", br ) ).as_bytes() ).await?;
@@ -740,12 +745,7 @@ async fn send_listener_ok( stream: &mut TcpStream, id: String, properties: &IcyP
 	stream.write_all( ( format!( "icy-genre:{}\r\n", properties.genre.as_ref().unwrap_or( &"Undefined".to_string() ) ) ).as_bytes() ).await?;
 	stream.write_all( ( format!( "icy-name:{}\r\n", properties.name.as_ref().unwrap_or( &"Unnamed Station".to_string() ) ) ).as_bytes() ).await?;
 	stream.write_all( ( format!( "icy-pub:{}\r\n", properties.public as usize ) ).as_bytes() ).await?;
-	stream.write_all( ( format!( "icy-url:{}\r\n", properties.url.as_ref().unwrap_or( &"Unknown".to_string() ) ) ).as_bytes() ).await?;
-	if meta_enabled {
-		stream.write_all( ( format!( "icy-metaint:{}\r\n\r\n", metaint ) ).as_bytes() ).await?;
-	} else {
-		stream.write_all( b"\r\n" ).await?;
-	}
+	stream.write_all( ( format!( "icy-url:{}\r\n\r\n", properties.url.as_ref().unwrap_or( &"Unknown".to_string() ) ) ).as_bytes() ).await?;
 	
 	Ok( () )
 }
