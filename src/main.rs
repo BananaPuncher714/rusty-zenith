@@ -743,6 +743,8 @@ async fn send_listener_ok( stream: &mut TcpStream, id: String, properties: &IcyP
 	stream.write_all( ( format!( "icy-url:{}\r\n", properties.url.as_ref().unwrap_or( &"Unknown".to_string() ) ) ).as_bytes() ).await?;
 	if meta_enabled {
 		stream.write_all( ( format!( "icy-metaint:{}\r\n\r\n", metaint ) ).as_bytes() ).await?;
+	} else {
+		stream.write_all( b"\r\n" ).await?;
 	}
 	
 	Ok( () )
