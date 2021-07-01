@@ -162,7 +162,7 @@ impl ServerProperties {
 			host: default_property_host(),
 			location: default_property_location(),
 			limits: default_property_limits(),
-			users: Vec::new()
+			users: default_property_users()
 		}
 	}
 }
@@ -432,12 +432,13 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					return Ok( () )
 				}
 				
-				// Reply with a 200 OK
-				send_listener_ok( &mut stream, server_id, &source.properties, serv.properties.metaint ).await?;
-				
-				// Create a client
 				// Check if metadata is enabled
 				let meta_enabled = get_header( "Icy-MetaData", req.headers ).unwrap_or( b"0" ) == b"1";
+				
+				// Reply with a 200 OK
+				send_listener_ok( &mut stream, server_id, &source.properties, meta_enabled, serv.properties.metaint ).await?;
+				
+				// Create a client
 				// Get a valid UUID
 				let client_id = {
 					let mut unique = Uuid::new_v4();
@@ -720,7 +721,7 @@ async fn write_to_client( stream: &mut TcpStream, sent_count: &mut usize, metale
 	stream.write_all( &send ).await
 }
 
-async fn send_listener_ok( stream: &mut TcpStream, id: String, properties: &IcyProperties, metaint: usize ) -> Result< (), Box< dyn Error > > {
+async fn send_listener_ok( stream: &mut TcpStream, id: String, properties: &IcyProperties, meta_enabled: bool, metaint: usize ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 200 OK\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
@@ -740,7 +741,9 @@ async fn send_listener_ok( stream: &mut TcpStream, id: String, properties: &IcyP
 	stream.write_all( ( format!( "icy-name:{}\r\n", properties.name.as_ref().unwrap_or( &"Unnamed Station".to_string() ) ) ).as_bytes() ).await?;
 	stream.write_all( ( format!( "icy-pub:{}\r\n", properties.public as usize ) ).as_bytes() ).await?;
 	stream.write_all( ( format!( "icy-url:{}\r\n", properties.url.as_ref().unwrap_or( &"Unknown".to_string() ) ) ).as_bytes() ).await?;
-	stream.write_all( ( format!( "icy-metaint:{}\r\n\r\n", metaint ) ).as_bytes() ).await?;
+	if meta_enabled {
+		stream.write_all( ( format!( "icy-metaint:{}\r\n\r\n", metaint ) ).as_bytes() ).await?;
+	}
 	
 	Ok( () )
 }
