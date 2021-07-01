@@ -194,7 +194,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 	match timeout( Duration::from_millis( header_timeout ), async {
 		// Get the header
 		while {
-			let mut headers = [ httparse::EMPTY_HEADER; 16 ];
+			let mut headers = [ httparse::EMPTY_HEADER; 32 ];
 			let mut req = httparse::Request::new( &mut headers );
 			match stream.read( &mut buffer ).await {
 				Ok( read ) => buf.extend_from_slice( &buffer[ .. read ] ),
@@ -226,7 +226,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 		}
 	}
 
-	let mut headers = [ httparse::EMPTY_HEADER; 16 ];
+	let mut headers = [ httparse::EMPTY_HEADER; 32 ];
 	let mut req = httparse::Request::new( &mut headers );
 	let body_offset = req.parse( &buf ).unwrap().unwrap();
 
@@ -1054,10 +1054,12 @@ async fn main() {
 	println!( "Using ADMIN          : {}", properties.admin );
 	println!( "Using HOST           : {}", properties.host );
 	println!( "Using LOCATION       : {}", properties.location );
+	println!( "Using CLIENT LIMIT   : {}", properties.limits.clients );
+	println!( "Using SOURCE LIMIT   : {}", properties.limits.sources );
 	println!( "Using QUEUE SIZE     : {}", properties.limits.queue_size );
 	println!( "Using BURST SIZE     : {}", properties.limits.burst_size );
 	println!( "Using HEADER TIMEOUT : {}", properties.limits.header_timeout );
-	println!( "Using SOURCE_TIMEOUT : {}", properties.limits.source_timeout );
+	println!( "Using SOURCE TIMEOUT : {}", properties.limits.source_timeout );
 	
 	if properties.users.is_empty() {
 		println!( "At least one user must be configured in the config!" );
