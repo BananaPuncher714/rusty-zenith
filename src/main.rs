@@ -1,6 +1,7 @@
 use httpdate::fmt_http_date;
 use regex::Regex;
 use serde::{ Deserialize, Serialize };
+use serde_json::json;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
@@ -15,7 +16,6 @@ use tokio::sync::RwLock;
 use tokio::sync::mpsc::{ UnboundedSender, UnboundedReceiver, unbounded_channel };
 use tokio::time::timeout;
 use uuid::Uuid;
-use serde_json::json;
 
 // Default constants
 const PORT: u16 = 8000;
@@ -58,7 +58,7 @@ struct Client {
 	receiver: RwLock< UnboundedReceiver< Arc< Vec< u8 > > > >,
 	buffer_size: RwLock< usize >,
 	properties: ClientProperties,
-	stats: RwLock<ClientStats>
+	stats: RwLock< ClientStats >
 }
 
 #[ derive( Clone ) ]
@@ -66,6 +66,20 @@ struct ClientProperties {
 	id: Uuid,
 	uagent: Option< String >,
 	metadata: bool
+}
+
+#[ derive( Serialize, Deserialize, Clone ) ]
+struct ClientStats {
+	bytes_sent: usize,
+
+}
+
+impl ClientStats {
+	fn new() -> ClientStats {
+		ClientStats {
+			bytes_sent: 0
+		}
+	}
 }
 
 struct IcyProperties {
@@ -109,7 +123,21 @@ struct Source {
 	metadata_vec: Vec< u8 >,
 	clients: HashMap< Uuid, Arc< RwLock< Client > > >,
 	burst_buffer: Vec< u8 >,
-	stats: RwLock<SourceStats>
+	stats: RwLock< SourceStats >
+}
+
+#[ derive( Serialize, Deserialize, Clone ) ]
+struct SourceStats {
+	bytes_read: usize,
+
+}
+
+impl SourceStats {
+	fn new() -> SourceStats {
+		SourceStats {
+			bytes_read: 0
+		}
+	}
 }
 
 // TODO Add permissions
@@ -172,9 +200,8 @@ impl ServerProperties {
 
 #[ derive( Serialize, Deserialize, Clone ) ]
 struct ServerStats {
-	start_date: u64,
+	start_time: u128,
 	peak_listeners: usize,
-	//total_bytes_sent: usize,
 	session_bytes_sent: usize,
 	session_bytes_read: usize,
 
@@ -183,42 +210,13 @@ struct ServerStats {
 impl ServerStats {
 	fn new() -> ServerStats {
 		ServerStats {
-			start_date: 0,
+			start_time: 0,
 			peak_listeners: 0,
 			session_bytes_sent: 0,
 			session_bytes_read: 0
 		}
 	}
 }
-
-#[ derive( Serialize, Deserialize, Clone ) ]
-struct SourceStats {
-	session_bytes_read: usize,
-
-}
-
-impl SourceStats {
-	fn new() -> SourceStats {
-		SourceStats {
-			session_bytes_read: 0
-		}
-	}
-}
-
-#[ derive( Serialize, Deserialize, Clone ) ]
-struct ClientStats {
-	session_bytes_sent: usize,
-
-}
-
-impl ClientStats {
-	fn new() -> ClientStats {
-		ClientStats {
-			session_bytes_sent: 0
-		}
-	}
-}
-
 
 // TODO Add stats
 struct Server {
@@ -379,7 +377,6 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			// Parse the headers for the source properties
 			populate_properties( &mut properties, req.headers );
 			
-			
 			// Create the source
 			let source = Source {
 				mountpoint: path.clone(),
@@ -388,7 +385,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				metadata_vec: vec![ 0 ],
 				clients: HashMap::new(),
 				burst_buffer: Vec::new(),
-				stats: RwLock::new(SourceStats::new())
+				stats: RwLock::new( SourceStats::new() )
 			};
 			
 			let queue_size = serv.properties.limits.queue_size;
@@ -433,7 +430,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					slice.extend_from_slice( &buf[ .. read  ] );
 					
 					broadcast_to_clients( &arc, slice, queue_size, burst_size ).await;
-					arc.read().await.stats.write().await.session_bytes_read+=read;
+					arc.read().await.stats.write().await.bytes_read += read;
 				}
 				
 				read != 0
@@ -448,8 +445,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			}
 			
 			serv.sources.remove( &path );
-			serv.stats.session_bytes_read += arc.read().await.stats.read().await.session_bytes_read;
-			
+			serv.stats.session_bytes_read += arc.read().await.stats.read().await.bytes_read;
 
 			println!( "Unmounted source {}", path );
 		}
@@ -531,7 +527,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					receiver: RwLock::new( receiver ),
 					buffer_size: RwLock::new( 0 ),
 					properties: properties.clone(),
-					stats: RwLock::new(ClientStats::new())
+					stats: RwLock::new( ClientStats::new() )
 				};
 	
 				
@@ -547,7 +543,6 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				// Get the metaint
 				let metalen = serv.properties.metaint;
 				
-				
 				// Keep track of how many bytes have been sent
 				let mut sent_count = 0;
 				// Send the burst on connect buffer
@@ -561,12 +556,8 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							stream.write_all( &burst_buf ).await
 						}
 					} {
-						Ok( _ ) => client.stats.write().await.session_bytes_sent+=burst_buf.len(),
-						Err( e ) if e.kind() == ErrorKind::ConnectionReset || e.kind() == ErrorKind::ConnectionAborted => (),
-						Err( e ) => {
-							println!( "An error occured while sending the burst on connect buffer: {}", e );
-							return Ok( () )
-						}
+						Ok( _ ) => client.stats.write().await.bytes_sent += burst_buf.len(),
+						Err( _ ) => return Ok( () ),
 					}
 				}
 				
@@ -577,9 +568,9 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				drop( source );
 				// Add our client
 				serv.clients.insert( client_id, properties );
-				if serv.stats.peak_listeners <  serv.clients.len(){
-					serv.stats.peak_listeners = serv.clients.len();
-				}
+				
+				// Set the max amount of listeners
+				serv.stats.peak_listeners = std::cmp::max( serv.stats.peak_listeners, serv.clients.len() );
 				
 				drop( serv );
 				
@@ -612,12 +603,8 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 									stream.write_all( &read.to_vec() ).await
 								}
 							} {
-								Ok( _ ) => client.stats.write().await.session_bytes_sent+=read.len(),
-								Err( e ) if e.kind() == ErrorKind::ConnectionReset || e.kind() == ErrorKind::ConnectionAborted => break,
-								Err( e ) => {
-									println!( "An error occured while streaming: {}", e );
-									break
-								}
+								Ok( _ ) => client.stats.write().await.bytes_sent += read.len(),
+								Err( _ ) => break,
 							}
 						} else {
 							break;
@@ -637,7 +624,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				let mut serv = server.write().await;
 				// Remove the client information from the list of clients
 				serv.clients.remove( &client_id );
-				serv.stats.session_bytes_sent += arc_client.read().await.stats.read().await.session_bytes_sent;
+				serv.stats.session_bytes_sent += arc_client.read().await.stats.read().await.bytes_sent;
 				drop( serv );
 			} else {
 				// Figure out what the request wants
@@ -645,9 +632,13 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				// Anything else is not vanilla or unimplemented
 				// Return a 404 otherwise
 				
+				// Drop the write lock
+				drop( serv );
+				
+				// Paths
 				match path.as_str() {
-					//paths
 					"/admin/metadata" => {
+						let serv = server.read().await;
 						// Check for authorization
 						if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
 							// For testing purposes right now
@@ -692,28 +683,35 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
 						}
 					}
-					"/admin/test" => {
-						
-						let mut total_bytes_sent = serv.stats.session_bytes_sent;
-						let mut total_bytes_read = serv.stats.session_bytes_read;
-						for source in serv.sources.values(){
-							total_bytes_read+= source.read().await.stats.read().await.session_bytes_read;
-							for clients in source.read().await.clients.values(){
-								total_bytes_sent+= clients.read().await.stats.read().await.session_bytes_sent;
+					"/api/stats" => {
+						let server = server.read().await;
+						let stats = &server.stats;
+						let mut total_bytes_sent = stats.session_bytes_sent;
+						let mut total_bytes_read = stats.session_bytes_read;
+						for source in server.sources.values(){
+							let source = source.read().await;
+							total_bytes_read += source.stats.read().await.bytes_read;
+							for clients in source.clients.values(){
+								total_bytes_sent += clients.read().await.stats.read().await.bytes_sent;
 							}
 						}
 						
-						let now = SystemTime::now();
-						let epoch = now.duration_since(UNIX_EPOCH).expect("Time went backwards!").as_secs();
+						let epoch = {
+							if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
+								time.as_millis()
+							} else {
+								0
+							}
+						};
 
-						let response = json!({
-							"uptime": epoch-serv.stats.start_date,
-							"peak_listeners": serv.stats.peak_listeners,
+						let response = json!( {
+							"uptime": epoch - stats.start_time,
+							"peak_listeners": stats.peak_listeners,
 							"session_bytes_read": total_bytes_read,
 							"session_bytes_sent": total_bytes_sent
-						});
+						} );
 
-						send_ok(&mut stream, server_id, Some(("application/json; charset=utf-8", &response.to_string()))).await?;
+						send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", &response.to_string() ) ) ).await?;
 
 					}
 					// Return 404
@@ -1144,8 +1142,6 @@ async fn main() {
 		}
 		Err( e ) => println!( "An error occured while to create the config file: {}", e ),
 	}
-	
-
 
 	println!( "Using PORT           : {}", properties.port );
 	println!( "Using METAINT        : {}", properties.metaint );
@@ -1169,11 +1165,13 @@ async fn main() {
 			Ok( listener ) => {
 				let server = Arc::new( RwLock::new( Server::new( properties ) ) );
 				
-				{
-					let start = SystemTime::now();
-					let since_the_epoch = start.duration_since(UNIX_EPOCH).expect("Time went backwards");
-					server.write().await.stats.start_date = since_the_epoch.as_secs();
+				if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
+					println!( "The server has started on {}", fmt_http_date( SystemTime::now() ) );
+					server.write().await.stats.start_time = time.as_millis();
+				} else {
+					println!( "Unable to capture when the server started!" );
 				}
+				
 				println!( "Listening..." );				
 				loop {
 					match listener.accept().await {
