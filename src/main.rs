@@ -1,7 +1,7 @@
 use httpdate::fmt_http_date;
 use regex::Regex;
 use serde::{ Deserialize, Serialize };
-use serde_json::json;
+use serde_json::{ json, Value };
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
@@ -54,6 +54,7 @@ struct Query {
 
 // TODO Add stats
 struct Client {
+	source: RwLock< String >,
 	sender: RwLock< UnboundedSender< Arc< Vec< u8 > > > >,
 	receiver: RwLock< UnboundedReceiver< Arc< Vec< u8 > > > >,
 	buffer_size: RwLock< usize >,
@@ -61,7 +62,7 @@ struct Client {
 	stats: RwLock< ClientStats >
 }
 
-#[ derive( Clone ) ]
+#[ derive( Serialize, Clone ) ]
 struct ClientProperties {
 	id: Uuid,
 	uagent: Option< String >,
@@ -70,16 +71,8 @@ struct ClientProperties {
 
 #[ derive( Serialize, Deserialize, Clone ) ]
 struct ClientStats {
-	bytes_sent: usize,
-
-}
-
-impl ClientStats {
-	fn new() -> ClientStats {
-		ClientStats {
-			bytes_sent: 0
-		}
-	}
+	start_date: u64,
+	bytes_sent: usize
 }
 
 struct IcyProperties {
@@ -123,13 +116,15 @@ struct Source {
 	metadata_vec: Vec< u8 >,
 	clients: HashMap< Uuid, Arc< RwLock< Client > > >,
 	burst_buffer: Vec< u8 >,
-	stats: RwLock< SourceStats >
+	stats: RwLock< SourceStats >,
+	fallback: Option< String >,
+	// Not really sure how else to signal when to disconnect the source
+	disconnect_flag: bool
 }
 
 #[ derive( Serialize, Deserialize, Clone ) ]
 struct SourceStats {
 	bytes_read: usize,
-
 }
 
 impl SourceStats {
@@ -200,11 +195,11 @@ impl ServerProperties {
 
 #[ derive( Serialize, Deserialize, Clone ) ]
 struct ServerStats {
-	start_time: u128,
+	// Use seconds instead of milliseconds since serde doesn't support u128 as of coding
+	start_time: u64,
 	peak_listeners: usize,
 	session_bytes_sent: usize,
 	session_bytes_read: usize,
-
 }
 
 impl ServerStats {
@@ -385,7 +380,9 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				metadata_vec: vec![ 0 ],
 				clients: HashMap::new(),
 				burst_buffer: Vec::new(),
-				stats: RwLock::new( SourceStats::new() )
+				stats: RwLock::new( SourceStats::new() ),
+				fallback: None,
+				disconnect_flag: false
 			};
 			
 			let queue_size = serv.properties.limits.queue_size;
@@ -393,11 +390,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			
 			// Add to the server
 			let arc = Arc::new( RwLock::new( source ) );
-			serv.sources.insert( path.clone(), arc.clone() );
+			serv.sources.insert( path, arc.clone() );
 			let source_timeout = serv.properties.limits.header_timeout;
 			drop( serv );
 			
-			println!( "Mounted source on {}", path );
+			println!( "Mounted source on {}", arc.read().await.mountpoint );
 			
 			if buf.len() < body_offset {
 				let slice = &buf[ body_offset .. ];
@@ -419,7 +416,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				} ).await {
 					Ok( n ) => n,
 					Err( _ ) => {
-						println!( "A source timed out: {}", path );
+						println!( "A source timed out: {}", arc.read().await.mountpoint );
 						0
 					}
 				};
@@ -433,26 +430,49 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					arc.read().await.stats.write().await.bytes_read += read;
 				}
 				
-				read != 0
+				// Check if the source needs to be disconnected
+				read != 0 && !arc.read().await.disconnect_flag
 			}  {}
 			
+			let mut source = arc.write().await;
+			let fallback = source.fallback.clone();
+			if let Some( fallback_id ) = fallback {
+				if let Some( fallback_source ) = server.read().await.sources.get( &fallback_id ) {
+					println!( "Moving listeners from {} to {}", source.mountpoint, fallback_id );
+					let mut fallback = fallback_source.write().await;
+					for ( uuid, client ) in source.clients.drain() {
+						println!( "Aquiring the client write lock..." );
+						*client.read().await.source.write().await = fallback_id.clone();
+						println!( "Successfully wrote the source!" );
+						fallback.clients.insert( uuid, client );
+					}
+				} else {
+					println!( "No fallback source {} found! Disconnecting listeners on {}", fallback_id, source.mountpoint );
+					for cli in source.clients.values() {
+						// Send an empty vec to signify the channel is closed
+						drop( cli.read().await.sender.write().await.send( Arc::new( Vec::new() ) ) );
+					}
+				}
+			} else {
+				// Disconnect each client by sending an empty buffer
+				println!( "Disconnecting listeners on {}", source.mountpoint );
+				for cli in source.clients.values() {
+					// Send an empty vec to signify the channel is closed
+					drop( cli.read().await.sender.write().await.send( Arc::new( Vec::new() ) ) );
+				}
+			}
+
 			// Clean up and remove the source
 			let mut serv = server.write().await;
-			// TODO Add a fallback mount
-			for cli in arc.read().await.clients.values() {
-				// Send an empty vec to signify the channel is closed
-				drop( cli.read().await.sender.write().await.send( Arc::new( Vec::new() ) ) );
-			}
-			
-			serv.sources.remove( &path );
-			serv.stats.session_bytes_read += arc.read().await.stats.read().await.bytes_read;
+			serv.sources.remove( &source.mountpoint );
+			serv.stats.session_bytes_read += source.stats.read().await.bytes_read;
 
-			println!( "Unmounted source {}", path );
+			println!( "Unmounted source {}", source.mountpoint );
 		}
 		"PUT" => {
 			// TODO Implement the PUT method
 			// I don't know any sources that use this method that I could easily get my hands on
-			// VLC only uses SHOUT
+			// VLC only uses SOURCE
 			// For now, return a 405
 			stream.write_all( b"HTTP/1.0 405 Method Not Allowed\r\n" ).await?;
 			stream.write_all( ( format!( "Server: {}\r\n", server_id ) ).as_bytes() ).await?;
@@ -522,19 +542,30 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					},
 					metadata: meta_enabled
 				};
+				let stats = ClientStats {
+					start_date: {
+						if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
+							time.as_secs()
+						} else {
+							0
+						}
+					},
+					bytes_sent: 0
+				};
 				let client = Client {
+					source: RwLock::new( source_id ),
 					sender: RwLock::new( sender ),
 					receiver: RwLock::new( receiver ),
 					buffer_size: RwLock::new( 0 ),
 					properties: properties.clone(),
-					stats: RwLock::new( ClientStats::new() )
+					stats: RwLock::new( stats )
 				};
 	
 				
 				if let Some( agent ) = &client.properties.uagent {
-					println!( "User {} started listening on {} with user-agent {}", client_id, source_id, agent );
+					println!( "User {} started listening on {} with user-agent {}", client_id, client.source.read().await, agent );
 				} else {
-					println!( "User {} started listening on {}", client_id, source_id );
+					println!( "User {} started listening on {}", client_id, client.source.read().await );
 				}
 				if meta_enabled {
 					println!( "User {} has icy metadata enabled", client_id );
@@ -577,8 +608,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				loop {
 					// Receive whatever bytes, then send to the client
 					let client = arc_client.read().await;
-					let mut queue = client.receiver.write().await;
-					let res = queue.recv().await;
+					let res = client.receiver.write().await.recv().await;
 					// Check if the channel is still alive
 					if let Some( read ) = res {
 						// If an empty buffer has been sent, then disconnect the client
@@ -589,7 +619,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 								if meta_enabled {
 									let meta_vec = {
 										let serv = server.read().await;
-										if let Some( source_lock ) = serv.sources.get( &source_id ) {
+										if let Some( source_lock ) = serv.sources.get( &*client.source.read().await ) {
 											let source = source_lock.read().await;
 											
 											source.metadata_vec.clone()
@@ -603,7 +633,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 									stream.write_all( &read.to_vec() ).await
 								}
 							} {
-								Ok( _ ) => client.stats.write().await.bytes_sent += read.len(),
+								Ok( _ ) => arc_client.read().await.stats.write().await.bytes_sent += read.len(),
 								Err( _ ) => break,
 							}
 						} else {
@@ -676,13 +706,98 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 										None => send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?,
 									}
 								}
-								_ => (),
+								_ => send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
 							}
 						} else {
 							// Bad request
 							send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
 						}
 					}
+					"/admin/listclients" => {
+						let serv = server.read().await;
+						// Check for authorization
+						if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
+							// For testing purposes right now
+							// TODO Add proper configuration
+							if !validate_user( &serv.properties, name, pass ) {
+								send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
+								return Ok( () )
+							}
+						} else {
+							// No auth, return and close
+							send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
+							return Ok( () )
+						}
+						
+						if let Some( queries ) = queries {
+							match get_queries_for( vec![ "mount" ], &queries )[ .. ].as_ref() {
+								[ Some( mount ) ] => {
+									if let Some( source ) = serv.sources.get( mount ) {
+										let mut clients: HashMap< Uuid, Value > = HashMap::new();
+										
+										for client in source.read().await.clients.values() {
+											let client = client.read().await;
+											let properties = client.properties.clone();
+											
+											let value = json!( {
+												"user_agent": properties.uagent,
+												"metadata_enabled": properties.metadata,
+												"stats": &*client.stats.read().await
+											} );
+										
+											clients.insert( properties.id, value );
+										}
+										
+										if let Ok( serialized ) = serde_json::to_string_pretty( &clients ) {									
+											send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", &serialized ) ) ).await?;
+										} else {
+											send_internal_error( &mut stream, server_id, None ).await?;
+										}
+									} else {
+										send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?;
+									}
+								}
+								_ => send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
+							}
+						} else {
+							// Bad request
+							send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
+						}
+					}
+					"/admin/fallbacks" => {
+						let serv = server.read().await;
+						// Check for authorization
+						if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
+							// For testing purposes right now
+							// TODO Add proper configuration
+							if !validate_user( &serv.properties, name, pass ) {
+								send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
+								return Ok( () )
+							}
+						} else {
+							// No auth, return and close
+							send_unauthorized( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
+							return Ok( () )
+						}
+						
+						if let Some( queries ) = queries {
+							match get_queries_for( vec![ "mount", "fallback" ], &queries )[ .. ].as_ref() {
+								[ Some( mount ), fallback ] => {
+									if let Some( source ) = serv.sources.get( mount ) {
+										source.write().await.fallback = fallback.clone();
+										
+										send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", "Success" ) ) ).await?;
+									} else {
+										send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?;
+									}
+								}
+								_ => send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
+							}
+						} else {
+							// Bad request
+							send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
+						}
+					},
 					"/api/stats" => {
 						let server = server.read().await;
 						let stats = &server.stats;
@@ -698,7 +813,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 						
 						let epoch = {
 							if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
-								time.as_millis()
+								time.as_secs()
 							} else {
 								0
 							}
@@ -862,6 +977,26 @@ async fn send_not_found( stream: &mut TcpStream, id: String, message: Option< ( 
 
 async fn send_ok( stream: &mut TcpStream, id: String, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
 	stream.write_all( b"HTTP/1.0 200 OK\r\n" ).await?;
+	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
+	stream.write_all( b"Connection: Close\r\n" ).await?;
+	if let Some( ( content_type, text ) ) = message {
+		stream.write_all( ( format!( "Content-Type: {}\r\n", content_type ) ).as_bytes() ).await?;
+		stream.write_all( ( format!( "Content-Length: {}\r\n", text.len() ) ).as_bytes() ).await?;
+	}
+	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
+	stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
+	stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
+	stream.write_all( b"Pragma: no-cache\r\n" ).await?;
+	stream.write_all( b"Access-Control-Allow-Origin: *\r\n\r\n" ).await?;
+	if let Some( ( _, text ) ) = message {
+		stream.write_all( text.as_bytes() ).await?;
+	}
+	
+	Ok( () )
+}
+
+async fn send_internal_error( stream: &mut TcpStream, id: String, message: Option< ( &str, &str ) > ) -> Result< (), Box< dyn Error > > {
+	stream.write_all( b"HTTP/1.0 500 Internal Server Error\r\n" ).await?;
 	stream.write_all( ( format!( "Server: {}\r\n", id ) ).as_bytes() ).await?;
 	stream.write_all( b"Connection: Close\r\n" ).await?;
 	if let Some( ( content_type, text ) ) = message {
@@ -1167,7 +1302,7 @@ async fn main() {
 				
 				if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
 					println!( "The server has started on {}", fmt_http_date( SystemTime::now() ) );
-					server.write().await.stats.start_time = time.as_millis();
+					server.write().await.stats.start_time = time.as_secs();
 				} else {
 					println!( "Unable to capture when the server started!" );
 				}

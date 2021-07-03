@@ -13,5 +13,5 @@ regex = "1.5.4"
 serde = { version = "1.0.126", features = [ "derive" ] }
 serde_json = "1.0.64" 
 tokio = { version = "1.6.1", features = [ "full" ] }
-uuid = { version = "0.8.2", features = [ "v4" ] }
+uuid = { version = "0.8.2", features = [ "v4", "serde" ] }
 urlencoding = "1.3.3"
