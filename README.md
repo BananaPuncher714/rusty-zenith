@@ -11,6 +11,14 @@ This program was created to allow updating and sending of a stream url in the ic
 - Supports `StreamTitle` and `StreamUrl`
 - Configurable users and passwords
 - Burst on connect
+- Supports fallbacks
+- Supports most Icecast vanilla admin functions
+
+## Differences between Icecast
+- No relay system in place currently
+- No SHOUTcast support
+- No XLST generated interfaces
+- Json response for admin/stats requests
 
 ## Config
 <details>
@@ -74,7 +82,6 @@ This program was created to allow updating and sending of a stream url in the ic
 - Add stats
 - Add a logging system
 - Implement the PUT request
-- Add a fallback mount
 - Add a permission system for users
 - Add a separate base directory for streams
 - Add per-mountpoint settings
