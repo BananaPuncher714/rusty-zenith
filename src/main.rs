@@ -369,7 +369,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			let source_stats = SourceStats {
 				start_date: {
 					if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
-						time.as_millis() as u64
+						time.as_secs()
 					} else {
 						0
 					}
@@ -548,7 +548,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				let stats = ClientStats {
 					start_date: {
 						if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
-							time.as_millis() as u64
+							time.as_secs()
 						} else {
 							0
 						}
@@ -974,7 +974,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 						
 						let epoch = {
 							if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
-								time.as_millis() as u64
+								time.as_secs()
 							} else {
 								0
 							}
@@ -1464,7 +1464,7 @@ async fn main() {
 				
 				if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
 					println!( "The server has started on {}", fmt_http_date( SystemTime::now() ) );
-					server.write().await.stats.start_time = time.as_millis() as u64;
+					server.write().await.stats.start_time = time.as_secs();
 				} else {
 					println!( "Unable to capture when the server started!" );
 				}
