@@ -13,12 +13,14 @@ This program was created to allow updating and sending of a stream url in the ic
 - Burst on connect
 - Supports fallbacks
 - Supports most Icecast vanilla admin functions
+- Per mountpoint limits
 
 ## Differences between Icecast
 - No relay system in place currently
 - No SHOUTcast support
-- No XLST generated interfaces
+- No XSLT generated interfaces
 - Json response for admin/stats requests
+- No SSL support
 
 ## Config
 <details>
@@ -38,7 +40,14 @@ This program was created to allow updating and sending of a stream url in the ic
     "queue_size": 102400,
     "burst_size": 65536,
     "header_timeout": 15000,
-    "source_timeout": 10000
+    "source_timeout": 10000,
+    "source_limits": {
+      "/radio": {
+        "clients": 400,
+        "burst_size": 65536,
+        "source_timeout": 10000
+      }
+    }
   },
   "users": [
     {
@@ -84,5 +93,4 @@ This program was created to allow updating and sending of a stream url in the ic
 - Implement the PUT request
 - Add a permission system for users
 - Add a separate base directory for streams
-- Add per-mountpoint settings
 - Add a relay system?

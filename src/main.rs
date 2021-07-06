@@ -108,6 +108,16 @@ impl IcyProperties {
 	}
 }
 
+#[ derive( Serialize, Deserialize, Clone ) ]
+struct SourceLimits {
+	#[ serde( default = "default_property_limits_clients" ) ]
+	clients: usize,
+	#[ serde( default = "default_property_limits_burst_size" ) ]
+	burst_size: usize,
+	#[ serde( default = "default_property_limits_source_timeout" ) ]
+	source_timeout: u64
+}
+
 // TODO Add stats
 struct Source {
 	// Is setting the mountpoint in the source really useful, since it's not like the source has any use for it
@@ -136,7 +146,7 @@ struct Credential {
 	password: String
 }
 
-#[ derive( Serialize, Deserialize, Copy, Clone ) ]
+#[ derive( Serialize, Deserialize, Clone ) ]
 struct ServerLimits {
 	#[ serde( default = "default_property_limits_clients" ) ]
 	clients: usize,
@@ -149,7 +159,9 @@ struct ServerLimits {
 	#[ serde( default = "default_property_limits_header_timeout" ) ]
 	header_timeout: u64,
 	#[ serde( default = "default_property_limits_source_timeout" ) ]
-	source_timeout: u64
+	source_timeout: u64,
+	#[ serde( default = "default_property_limits_source_limits" ) ]
+	source_limits: HashMap< String, SourceLimits >
 }
 
 #[ derive( Serialize, Deserialize, Clone ) ]
@@ -391,12 +403,17 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			};
 			
 			let queue_size = serv.properties.limits.queue_size;
-			let burst_size = serv.properties.limits.burst_size;
+			let ( burst_size, source_timeout ) =  {
+				if let Some( limit ) = serv.properties.limits.source_limits.get( &path ) {
+					( limit.burst_size, limit.source_timeout )
+				} else {
+					( serv.properties.limits.burst_size, serv.properties.limits.header_timeout )
+				}
+			};
 			
 			// Add to the server
 			let arc = Arc::new( RwLock::new( source ) );
 			serv.sources.insert( path, arc.clone() );
-			let source_timeout = serv.properties.limits.header_timeout;
 			drop( serv );
 			
 			println!( "Mounted source on {}", arc.read().await.mountpoint );
@@ -507,7 +524,14 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				let mut source = source_lock.write().await;
 				
 				// Check if the max number of listeners has been reached
-				if serv.clients.len() > serv.properties.limits.clients {
+				let too_many_clients = {
+					if let Some( limit ) = serv.properties.limits.source_limits.get( &source_id ) {
+						source.clients.len() >= limit.clients
+					} else {
+						false
+					}
+				};
+				if serv.clients.len() >= serv.properties.limits.clients || too_many_clients {
 					send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Too many listeners connected" ) ) ).await?;
 					return Ok( () )
 				}
@@ -1375,7 +1399,8 @@ fn default_property_limits() -> ServerLimits { ServerLimits{
 	queue_size: default_property_limits_queue_size(),
 	burst_size: default_property_limits_burst_size(),
 	header_timeout: default_property_limits_header_timeout(),
-	source_timeout: default_property_limits_source_timeout()
+	source_timeout: default_property_limits_source_timeout(),
+	source_limits: default_property_limits_source_limits()
 } }
 fn default_property_limits_clients() -> usize { CLIENTS }
 fn default_property_limits_sources() -> usize { SOURCES }
@@ -1383,6 +1408,16 @@ fn default_property_limits_queue_size() -> usize { QUEUE_SIZE }
 fn default_property_limits_burst_size() -> usize { BURST_SIZE }
 fn default_property_limits_header_timeout() -> u64 { HEADER_TIMEOUT }
 fn default_property_limits_source_timeout() -> u64 { SOURCE_TIMEOUT }
+fn default_property_limits_source_mountpoint() -> String { "/radio".to_string() }
+fn default_property_limits_source_limits() -> HashMap< String, SourceLimits > {
+	let mut map = HashMap::new();
+	map.insert( default_property_limits_source_mountpoint(), SourceLimits {
+		clients: default_property_limits_clients(),
+		burst_size: default_property_limits_burst_size(),
+		source_timeout: default_property_limits_source_timeout()
+	} );
+	map
+}	
 
 #[ tokio::main ]
 async fn main() {
@@ -1452,6 +1487,12 @@ async fn main() {
 	println!( "Using BURST SIZE     : {}", properties.limits.burst_size );
 	println!( "Using HEADER TIMEOUT : {}", properties.limits.header_timeout );
 	println!( "Using SOURCE TIMEOUT : {}", properties.limits.source_timeout );
+	for ( mount, limit ) in &properties.limits.source_limits {
+		println!( "Using limits for {}:", mount );
+		println!( "  CLIENT LIMIT   : {}", limit.clients );
+		println!( "  SOURCE TIMEOUT : {}", limit.source_timeout );
+		println!( "  BURST SIZE     : {}", limit.burst_size );
+	}
 	
 	if properties.users.is_empty() {
 		println!( "At least one user must be configured in the config!" );
