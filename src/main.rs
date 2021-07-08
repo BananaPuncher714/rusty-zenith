@@ -826,6 +826,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 									if let Some( source ) = serv.sources.get( mount ) {
 										source.write().await.fallback = fallback.clone();
 										
+										if let Some( fallback ) = fallback {
+											println!( "Set the fallback for {} to {}", mount, fallback );
+										} else {
+											println!( "Unset the fallback for {}", mount );
+										}
 										send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", "Success" ) ) ).await?;
 									} else {
 										send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?;
@@ -867,6 +872,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 												to.clients.insert( uuid, client );
 											}
 											
+											println!( "Moved clients from {} to {}", mount, dest );
 											send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", "Success" ) ) ).await?;
 										}
 										_ => send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?,
@@ -902,6 +908,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 										( Some( source ), Ok( uuid ) ) => {
 											if let Some( client ) = source.read().await.clients.get( &uuid ) {
 												drop( client.read().await.sender.write().await.send( Arc::new( Vec::new() ) ) );
+												println!( "Killing client {}", uuid );
 												send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", "Success" ) ) ).await?;
 											} else {
 												send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid id" ) ) ).await?;
@@ -940,6 +947,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 									if let Some( source ) = serv.sources.get( mount ) {
 										source.write().await.disconnect_flag = true;
 										
+										println!( "Killing source {}", mount );
 										send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", "Success" ) ) ).await?;
 									} else {
 										send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?;
