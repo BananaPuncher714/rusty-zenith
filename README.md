@@ -14,6 +14,12 @@ This program was created to allow updating and sending of a stream url in the ic
 - Supports fallbacks
 - Supports most Icecast vanilla admin functions
 - Per mountpoint limits
+- API for stats
+
+## API
+These statistics do not require admin authentication:
+- `/api/serverinfo` - Returns information about the server, including available mounts, properties, and basic statistics.
+- `/api/mountinfo` - Returns information about a mount specified with the `mount` query field.
 
 ## Differences between Icecast
 - No relay system in place currently
@@ -34,6 +40,7 @@ This program was created to allow updating and sending of a stream url in the ic
   "admin": "admin@localhost",
   "host": "localhost",
   "location": "1.048596",
+  "description": "Yet Another Internet Radio",
   "limits": {
     "clients": 400,
     "sources": 4,
@@ -70,6 +77,7 @@ This program was created to allow updating and sending of a stream url in the ic
 - `admin`: The contact information for the server
 - `host`: Public facing domain/url
 - `location`: Geographic location
+- `description`: A description of the server
 - `limits.clients`: Maximum number of concurrent listeners supported by the server. Does not include static accesses, such as requests to gather stats. This is the max number of listeners for the entire server, not per mountpoint.
 - `limit.sources`: Maximum number of connected sources supported by the server.
 - `limits.queue_size`: **(Taken from the Icecast docs)**
@@ -88,7 +96,6 @@ This program was created to allow updating and sending of a stream url in the ic
 
 
 ## TODO
-- Add stats
 - Add a logging system
 - Implement the PUT request
 - Add a permission system for users

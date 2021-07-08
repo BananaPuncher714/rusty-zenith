@@ -31,6 +31,8 @@ const ADMIN: &str = "admin@localhost";
 const HOST: &str = "localhost";
 // Geographic location. Icecast included it in their settings, so why not
 const LOCATION: &str = "1.048596";
+// Description of the internet radio
+const DESCRIPTION: &str = "Yet Another Internet Radio";
 
 // How many sources can be connected, in total
 const SOURCES: usize = 4;
@@ -52,7 +54,6 @@ struct Query {
 	value: String
 }
 
-// TODO Add stats
 struct Client {
 	source: RwLock< String >,
 	sender: RwLock< UnboundedSender< Arc< Vec< u8 > > > >,
@@ -71,7 +72,7 @@ struct ClientProperties {
 
 #[ derive( Serialize, Clone ) ]
 struct ClientStats {
-	start_date: u64,
+	start_time: u64,
 	bytes_sent: usize
 }
 
@@ -118,7 +119,6 @@ struct SourceLimits {
 	source_timeout: u64
 }
 
-// TODO Add stats
 struct Source {
 	// Is setting the mountpoint in the source really useful, since it's not like the source has any use for it
 	mountpoint: String,
@@ -135,8 +135,9 @@ struct Source {
 
 #[ derive( Serialize, Deserialize, Clone ) ]
 struct SourceStats {
-	start_date: u64,
+	start_time: u64,
 	bytes_read: usize,
+	peak_listeners: usize
 }
 
 // TODO Add permissions
@@ -178,6 +179,8 @@ struct ServerProperties {
 	host: String,
 	#[ serde( default = "default_property_location" ) ]
 	location: String,
+	#[ serde( default = "default_property_description" ) ]
+	description: String,
 	#[ serde( default = "default_property_limits" ) ]
 	limits: ServerLimits,
 	#[ serde( default = "default_property_users" ) ]
@@ -193,6 +196,7 @@ impl ServerProperties {
 			admin: default_property_admin(),
 			host: default_property_host(),
 			location: default_property_location(),
+			description: default_property_description(),
 			limits: default_property_limits(),
 			users: default_property_users()
 		}
@@ -201,7 +205,6 @@ impl ServerProperties {
 
 #[ derive( Serialize, Deserialize, Clone ) ]
 struct ServerStats {
-	// Use seconds instead of milliseconds since serde doesn't support u128 as of coding
 	start_time: u64,
 	peak_listeners: usize,
 	session_bytes_sent: usize,
@@ -269,11 +272,8 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 		
 		Ok( () )
 	} ).await {
-		Ok( res ) => {
-			if res.is_err() {
-				return Ok( () )
-			}
-		}
+		Ok( Err( _ ) ) => return Ok( () ),
+		Ok( _ ) => (),
 		Err( _ ) => {
 			println!( "An incoming request failed to complete in time" );
 			return Ok( () )
@@ -379,14 +379,15 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			populate_properties( &mut properties, req.headers );
 			
 			let source_stats = SourceStats {
-				start_date: {
+				start_time: {
 					if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
 						time.as_secs()
 					} else {
 						0
 					}
 				},
-				bytes_read: 0
+				bytes_read: 0,
+				peak_listeners: 0
 			};
 			
 			// Create the source
@@ -501,7 +502,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
 			stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
 			stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
-			stream.write_all( b"Pragma: no-cache\r\n\r\n" ).await?;
+			stream.write_all( b"Pragma: no-cache\r\n" ).await?;
 			stream.write_all( b"Access-Control-Allow-Origin: *\r\n\r\n" ).await?;
 		}
 		"GET" => {
@@ -570,7 +571,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					metadata: meta_enabled
 				};
 				let stats = ClientStats {
-					start_date: {
+					start_time: {
 						if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
 							time.as_secs()
 						} else {
@@ -622,6 +623,12 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				let arc_client = Arc::new( RwLock::new( client ) );
 				// Add the client id to the list of clients attached to the source
 				source.clients.insert( client_id, arc_client.clone() );
+				
+				{
+					let mut source_stats = source.stats.write().await;
+					source_stats.peak_listeners = std::cmp::max( source_stats.peak_listeners, source.clients.len() );
+				}
+				
 				// No more need for source
 				drop( source );
 				// Add our client
@@ -981,6 +988,74 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", &serialized ) ) ).await?;
 						} else {
 							send_internal_error( &mut stream, server_id, None ).await?;
+						}
+					}
+					"/api/serverinfo" => {
+						let serv = server.read().await;
+						
+						let info = json!( {
+							"mounts": serv.sources.keys().cloned().collect::< Vec< String > >(),
+							"properties": {
+								"server_id": serv.properties.server_id,
+								"admin": serv.properties.admin,
+								"host": serv.properties.host,
+								"location": serv.properties.location,
+								"description": serv.properties.description
+							},
+							"stats": {
+								"start_time": serv.stats.start_time,
+								"peak_listeners": serv.stats.peak_listeners
+							},
+							"current_listeners": serv.clients.len()
+						} );
+						
+						if let Ok( serialized ) = serde_json::to_string( &info ) {
+							send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", &serialized ) ) ).await?;
+						} else {
+							send_internal_error( &mut stream, server_id, None ).await?;
+						}
+					}
+					"/api/mountinfo" => {
+						let serv = server.read().await;
+						if let Some( queries ) = queries {
+							match get_queries_for( vec![ "mount" ], &queries )[ .. ].as_ref() {
+								[ Some( mount ) ] => {
+									if let Some( source ) = serv.sources.get( mount ) {
+										let source = source.read().await;
+										let properties = &source.properties;
+										let stats = &source.stats.read().await;
+										
+										let info = json!( {
+											"metadata": source.metadata,
+											"properties": {
+												"name": properties.name,
+												"description": properties.description,
+												"url": properties.url,
+												"genre": properties.genre,
+												"bitrate": properties.bitrate,
+												"content_type": properties.content_type
+											},
+											"stats": {
+												"start_time": stats.start_time,
+												"peak_listeners": stats.peak_listeners
+											},
+											"current_listeners": source.clients.len()
+										} );
+										
+										if let Ok( serialized ) = serde_json::to_string( &info ) {
+											send_ok( &mut stream, server_id, Some( ( "application/json; charset=utf-8", &serialized ) ) ).await?;
+										} else {
+											send_internal_error( &mut stream, server_id, None ).await?;
+										}
+									} else {
+										send_forbidden( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid mount" ) ) ).await?;
+									}
+								}
+								_ => send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?,
+							}
+						} else {
+							// Bad request
+							send_bad_request( &mut stream, server_id, Some( ( "text/plain; charset=utf-8", "Invalid query" ) ) ).await?;
 						}
 					}
 					"/api/stats" => {
@@ -1392,6 +1467,7 @@ fn default_property_server_id() -> String { SERVER_ID.to_string() }
 fn default_property_admin() -> String { ADMIN.to_string() }
 fn default_property_host() -> String { HOST.to_string() }
 fn default_property_location() -> String { LOCATION.to_string() }
+fn default_property_description() -> String { DESCRIPTION.to_string() }
 fn default_property_users() -> Vec< Credential > { vec![ Credential{ username: "admin".to_string(), password: "hackme".to_string() }, Credential { username: "source".to_string(), password: "hackme".to_string() } ] }
 fn default_property_limits() -> ServerLimits { ServerLimits{
 	clients: default_property_limits_clients(),
@@ -1481,6 +1557,7 @@ async fn main() {
 	println!( "Using ADMIN          : {}", properties.admin );
 	println!( "Using HOST           : {}", properties.host );
 	println!( "Using LOCATION       : {}", properties.location );
+	println!( "Using DESCRIPTION    : {}", properties.description );
 	println!( "Using CLIENT LIMIT   : {}", properties.limits.clients );
 	println!( "Using SOURCE LIMIT   : {}", properties.limits.sources );
 	println!( "Using QUEUE SIZE     : {}", properties.limits.queue_size );
@@ -1489,9 +1566,9 @@ async fn main() {
 	println!( "Using SOURCE TIMEOUT : {}", properties.limits.source_timeout );
 	for ( mount, limit ) in &properties.limits.source_limits {
 		println!( "Using limits for {}:", mount );
-		println!( "  CLIENT LIMIT   : {}", limit.clients );
-		println!( "  SOURCE TIMEOUT : {}", limit.source_timeout );
-		println!( "  BURST SIZE     : {}", limit.burst_size );
+		println!( "      CLIENT LIMIT   : {}", limit.clients );
+		println!( "      SOURCE TIMEOUT : {}", limit.source_timeout );
+		println!( "      BURST SIZE     : {}", limit.burst_size );
 	}
 	
 	if properties.users.is_empty() {
