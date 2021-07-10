@@ -604,21 +604,10 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				
 				// Keep track of how many bytes have been sent
 				let mut sent_count = 0;
-				// Send the burst on connect buffer
-				let burst_buf = &source.burst_buffer;
-				if !burst_buf.is_empty() {
-					match {
-						if meta_enabled {
-							let meta_vec = source.metadata_vec.clone();
-							write_to_client( &mut stream, &mut sent_count, metalen, burst_buf, &meta_vec ).await
-						} else {
-							stream.write_all( &burst_buf ).await
-						}
-					} {
-						Ok( _ ) => client.stats.write().await.bytes_sent += burst_buf.len(),
-						Err( _ ) => return Ok( () ),
-					}
-				}
+				
+				// Get a copy of the burst buffer and metadata
+				let burst_buf = source.burst_buffer.clone();
+				let metadata_copy = source.metadata_vec.clone();
 				
 				let arc_client = Arc::new( RwLock::new( client ) );
 				// Add the client id to the list of clients attached to the source
@@ -631,6 +620,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				
 				// No more need for source
 				drop( source );
+				
 				// Add our client
 				serv.clients.insert( client_id, properties );
 				
@@ -638,6 +628,22 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				serv.stats.peak_listeners = std::cmp::max( serv.stats.peak_listeners, serv.clients.len() );
 				
 				drop( serv );
+				
+				// Send the burst on connect buffer
+				if !burst_buf.is_empty() {
+					match {
+						if meta_enabled {
+							write_to_client( &mut stream, &mut sent_count, metalen, &burst_buf, &metadata_copy ).await
+						} else {
+							stream.write_all( &burst_buf ).await
+						}
+					} {
+						Ok( _ ) => arc_client.read().await.stats.write().await.bytes_sent += burst_buf.len(),
+						Err( _ ) => return Ok( () ),
+					}
+				}
+				drop( metadata_copy );
+				drop( burst_buf );
 				
 				loop {
 					// Receive whatever bytes, then send to the client
@@ -1024,10 +1030,10 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 						}
 					}
 					"/api/mountinfo" => {
-						let serv = server.read().await;
 						if let Some( queries ) = queries {
 							match get_queries_for( vec![ "mount" ], &queries )[ .. ].as_ref() {
 								[ Some( mount ) ] => {
+									let serv = server.read().await;
 									if let Some( source ) = serv.sources.get( mount ) {
 										let source = source.read().await;
 										let properties = &source.properties;
