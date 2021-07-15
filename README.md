@@ -23,6 +23,7 @@ These statistics do not require admin authentication:
 
 <details>
   <summary>Example response</summary>
+  
 ```json
 {
   "current_listeners": 3,
@@ -49,6 +50,7 @@ These statistics do not require admin authentication:
 
 <details>
 <summary>Example response</summary>
+
 ```json
 {
   "current_listeners": 2,
