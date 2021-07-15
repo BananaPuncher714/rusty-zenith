@@ -630,59 +630,68 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				drop( serv );
 				
 				// Send the burst on connect buffer
-				if !burst_buf.is_empty() {
-					match {
-						if meta_enabled {
-							write_to_client( &mut stream, &mut sent_count, metalen, &burst_buf, &metadata_copy ).await
-						} else {
-							stream.write_all( &burst_buf ).await
+				let burst_success = {
+					if !burst_buf.is_empty() {
+						match {
+							if meta_enabled {
+								write_to_client( &mut stream, &mut sent_count, metalen, &burst_buf, &metadata_copy ).await
+							} else {
+								stream.write_all( &burst_buf ).await
+							}
+						} {
+							Ok( _ ) => {
+								arc_client.read().await.stats.write().await.bytes_sent += burst_buf.len();
+								true
+							}
+							Err( _ ) => false,
 						}
-					} {
-						Ok( _ ) => arc_client.read().await.stats.write().await.bytes_sent += burst_buf.len(),
-						Err( _ ) => return Ok( () ),
+					} else {
+						true
 					}
-				}
+				};
 				drop( metadata_copy );
 				drop( burst_buf );
 				
-				loop {
-					// Receive whatever bytes, then send to the client
-					let client = arc_client.read().await;
-					let res = client.receiver.write().await.recv().await;
-					// Check if the channel is still alive
-					if let Some( read ) = res {
-						// If an empty buffer has been sent, then disconnect the client
-						if read.len() > 0 {
-							// Decrease the internal buffer
-							*client.buffer_size.write().await -= read.len();
-							match {
-								if meta_enabled {
-									let meta_vec = {
-										let serv = server.read().await;
-										if let Some( source_lock ) = serv.sources.get( &*client.source.read().await ) {
-											let source = source_lock.read().await;
-											
-											source.metadata_vec.clone()
-										} else {
-											vec![ 0 ]
-										}
-									};
-									
-									write_to_client( &mut stream, &mut sent_count, metalen, &read.to_vec(), &meta_vec ).await
-								} else {
-									stream.write_all( &read.to_vec() ).await
+				if burst_success {
+					loop {
+						// Receive whatever bytes, then send to the client
+						let client = arc_client.read().await;
+						let res = client.receiver.write().await.recv().await;
+						// Check if the channel is still alive
+						if let Some( read ) = res {
+							// If an empty buffer has been sent, then disconnect the client
+							if read.len() > 0 {
+								// Decrease the internal buffer
+								*client.buffer_size.write().await -= read.len();
+								match {
+									if meta_enabled {
+										let meta_vec = {
+											let serv = server.read().await;
+											if let Some( source_lock ) = serv.sources.get( &*client.source.read().await ) {
+												let source = source_lock.read().await;
+												
+												source.metadata_vec.clone()
+											} else {
+												vec![ 0 ]
+											}
+										};
+										
+										write_to_client( &mut stream, &mut sent_count, metalen, &read.to_vec(), &meta_vec ).await
+									} else {
+										stream.write_all( &read.to_vec() ).await
+									}
+								} {
+									Ok( _ ) => arc_client.read().await.stats.write().await.bytes_sent += read.len(),
+									Err( _ ) => break,
 								}
-							} {
-								Ok( _ ) => arc_client.read().await.stats.write().await.bytes_sent += read.len(),
-								Err( _ ) => break,
+							} else {
+								break;
 							}
 						} else {
+							// The sender has been dropped
+							// The listener has been kicked
 							break;
 						}
-					} else {
-						// The sender has been dropped
-						// The listener has been kicked
-						break;
 					}
 				}
 				

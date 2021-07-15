@@ -17,9 +17,70 @@ This program was created to allow updating and sending of a stream url in the ic
 - API for stats
 
 ## API
+### Public Endpoints
 These statistics do not require admin authentication:
 - `/api/serverinfo` - Returns information about the server, including available mounts, properties, and basic statistics.
+
+<details>
+  <summary>Example response</summary>
+```json
+{
+  "current_listeners": 3,
+  "mounts": [
+    "/radio",
+    "/dev"
+  ],
+  "properties": {
+    "admin": "admin@localhost",
+    "description": "Yet Another Internet Radio",
+    "host": "https://example.com",
+    "location": "Earth",
+    "server_id": "Rusty Zenith 0.1.0"
+  },
+  "stats": {
+    "peak_listeners": 6,
+    "start_time": 1625759418
+  }
+}
+```
+</details>
+
 - `/api/mountinfo` - Returns information about a mount specified with the `mount` query field.
+
+<details>
+<summary>Example response</summary>
+```json
+{
+  "current_listeners": 2,
+  "metadata": {
+    "title": "Franz Liszt - Hungarian Rhapsody No. 2",
+    "url": "https://via.placeholder.com/400.png"
+  },
+  "properties": {
+    "bitrate": null,
+    "content_type": "audio/mpeg",
+    "description": "24/7 classical music station",
+    "genre": "Classical",
+    "name": "Rusty Radio",
+    "url": "https://www.example.com"
+  },
+  "stats": {
+    "peak_listeners": 4,
+    "start_time": 1626308059
+  }
+}
+```
+</details>
+
+### Admin Functions
+Rusty Zenith supports the following [Icecast admin functions](https://icecast.org/docs/icecast-latest/admin-interface.html):
+- `/admin/metadata`
+- `/admin/fallbacks`
+- `/admin/listclients`
+- `/admin/moveclients`
+- `/admin/killclient` - Uses client UUID instead
+- `/admin/killsource`
+- `/admin/listmounts` 
 
 ## Differences between Icecast
 - No relay system in place currently
