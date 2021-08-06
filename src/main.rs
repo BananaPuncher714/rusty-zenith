@@ -494,10 +494,6 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			}
 
 			source_stream(&mut stream, &source_timeout, &arc, queue_size, burst_size).await.ok();
-			if method == "PUT" {
-				// request must end with server 200 OK response
-				send_ok( &mut stream, &server_id, None ).await.ok();
-			}
 
 			let mut source = arc.write().await;
 			let fallback = source.fallback.clone();
@@ -529,6 +525,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			let mut serv = server.write().await;
 			serv.sources.remove( &source.mountpoint );
 			serv.stats.session_bytes_read += source.stats.read().await.bytes_read;
+
+			if method == "PUT" {
+				// request must end with server 200 OK response
+				send_ok( &mut stream, &server_id, None ).await.ok();
+			}
 
 			println!( "Unmounted source {}", source.mountpoint );
 		}
