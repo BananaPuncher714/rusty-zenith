@@ -414,6 +414,38 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			// Parse the headers for the source properties
 			populate_properties( &mut properties, req.headers );
 
+			if method == "SOURCE" {
+				// Give an 200 OK response
+				send_ok( &mut stream, &server_id, None ).await?;
+			} else {
+				// Check if client sent Expect: 100-continue in header, if that's the case we will need to return 100 in status code
+				// Without it, it means that client has no body to send, we will stop if that's the case
+				match get_header( "Expect", req.headers ) {
+					Some(v) => {
+						match std::str::from_utf8(v) {
+							Ok(parsed) => {
+								if parsed == "100-continue" {
+									send_continue( &mut stream, &server_id ).await.ok();
+								} else {
+									// Some unknown value is passed
+									send_bad_request(&mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Expected 100-continue in Expect header" ) ) ).await?;
+									return Ok( () )
+								}
+							},
+							Err(_) => {
+								// Some unknown unicode used. STOP
+								send_bad_request(&mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Unknown unicode used in headers" ) ) ).await?;
+								return Ok( () )
+							}
+						}
+					},
+					None => {
+						send_bad_request(&mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "PUT request must come with Expect header" ) ) ).await?;
+						return Ok( () )
+					}
+				}
+			}
+
 			let source_stats = SourceStats {
 				start_time: {
 					if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
@@ -425,6 +457,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				bytes_read: 0,
 				peak_listeners: 0
 			};
+
 
 			// Create the source
 			let source = Source {
@@ -460,41 +493,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				broadcast_to_clients( &arc, slice.to_vec(), queue_size, burst_size ).await;
 			}
 
-			if method == "SOURCE" {
-				// Give an 200 OK response
-				send_ok( &mut stream, &server_id, None ).await?;
-				source_stream(&mut stream, &source_timeout, &arc, queue_size, burst_size).await.ok();
-			} else {
-				// Check if client sent Expect: 100-continue in header, if that's the case we will need to return 100 in status code
-				// Without it, it means that client has no body to send, we will stop if that's the case
-				match get_header( "Expect", req.headers ) {
-					Some(v) => {
-						match std::str::from_utf8(v) {
-							Ok(parsed) => {
-								if parsed == "100-continue" {
-									send_continue( &mut stream, &server_id ).await?;
-								} else {
-									// Some unknown value is passed
-									send_bad_request(&mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Expected 100-continue in Expect header" ) ) ).await?;
-									return Ok( () )
-								}
-							},
-							Err(_) => {
-								// Some unknown unicode used. STOP
-								send_bad_request(&mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Unknown unicode used in headers" ) ) ).await?;
-								return Ok( () )
-							}
-						}
-					},
-					None => {
-						send_bad_request(&mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "PUT request must come with Expect header" ) ) ).await?;
-						return Ok( () )
-					}
-				}
-				source_stream(&mut stream, &source_timeout, &arc, queue_size, burst_size).await.ok();
-				// request must end with server 200 OK response
-				send_ok( &mut stream, &server_id, None ).await.ok();
-			}
+			source_stream(&mut stream, &source_timeout, &arc, queue_size, burst_size).await.ok();
 
 			let mut source = arc.write().await;
 			let fallback = source.fallback.clone();
@@ -526,6 +525,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			let mut serv = server.write().await;
 			serv.sources.remove( &source.mountpoint );
 			serv.stats.session_bytes_read += source.stats.read().await.bytes_read;
+
+			if method == "PUT" {
+				// request must end with server 200 OK response
+				send_ok( &mut stream, &server_id, None ).await.ok();
+			}
 
 			println!( "Unmounted source {}", source.mountpoint );
 		}
