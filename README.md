@@ -2,10 +2,11 @@
 A basic internet radio server written in rust that uses Icecast's HTTP protocol. Inspired by [Icecast 2](https://icecast.org/).
 
 ## About
-This program was created to allow updating and sending of a stream url in the icy metadata sent to compatible listeners. It currently serves `SOURCE` requests, listeners, and updating of mount metadata nearly identical to Icecast. [VLC](https://www.videolan.org/) was used as a source for testing.
+This program was created to allow updating and sending of a stream url in the icy metadata sent to compatible listeners. It currently serves `SOURCE` requests, listeners, and updating of mount metadata nearly identical to Icecast. [VLC](https://www.videolan.org/) and [FFMPEG](https://www.ffmpeg.org/) was used as a source for testing.
 
 ## Features
 - Supports Icecast `SOURCE` requests
+- Supports PUT requests, but without transfer encoding
 - Supports Icecast metadata updates
 - Supports `Icy-Metadata`
 - Supports `StreamTitle` and `StreamUrl`
@@ -91,6 +92,9 @@ Rusty Zenith supports the following [Icecast admin functions](https://icecast.or
 - Json response for admin/stats requests
 - No SSL support
 
+## Usage
+Compile with `cargo build --release`. Execute via command line and connect as you would with Icecast.
+
 ## Config
 <details>
   <summary>Default configuration (Click to expand)</summary> 
@@ -160,7 +164,7 @@ Rusty Zenith supports the following [Icecast admin functions](https://icecast.or
 
 ## TODO
 - Add a logging system
-- Implement the PUT request
 - Add a permission system for users
 - Add a separate base directory for streams
 - Add a relay system?
+- Add support for chunked transfer encoding?

@@ -241,45 +241,6 @@ impl Server {
 	}
 }
 
-async fn source_stream(stream: &mut TcpStream, source_timeout: &u64, arc: &Arc<RwLock<Source>>, queue_size: usize, burst_size: usize)
-		  -> Result< (), Box< dyn Error > > {
-	// SOURCE http method
-
-	// Listen for bytes
-	while {
-		// Read the incoming stream data until it closes
-		let mut buf = [ 0; 1024 ];
-		let read = match timeout( Duration::from_millis( *source_timeout ), async {
-			match stream.read( &mut buf ).await {
-				Ok( n ) => n,
-				Err( e ) => {
-					println!( "An error occured while reading stream data: {}", e );
-					0
-				}
-			}
-		} ).await {
-			Ok( n ) => n,
-			Err( _ ) => {
-				println!( "A source timed out: {}", arc.read().await.mountpoint );
-				0
-			}
-		};
-
-		if read != 0 {
-			// Get the slice
-			let mut slice: Vec< u8 > = Vec::new();
-			slice.extend_from_slice( &buf[ .. read  ] );
-
-			broadcast_to_clients( &arc, slice, queue_size, burst_size ).await;
-			arc.read().await.stats.write().await.bytes_read += read;
-		}
-
-		// Check if the source needs to be disconnected
-		read != 0 && !arc.read().await.disconnect_flag
-	}  {}
-	Ok( () )
-}
-
 async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStream ) -> Result< (), Box< dyn Error > > {
 	let mut buf = Vec::new();
 	let mut buffer = [ 0; 512 ];
@@ -418,29 +379,30 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				// Give an 200 OK response
 				send_ok( &mut stream, &server_id, None ).await?;
 			} else {
+				// Verify that the transfer encoding is identity or not included
+				// No support for chunked or encoding ATM
+				// TODO Add support for transfer encoding options as specified here: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Transfer-Encoding
+				// TODO Also potentially add support for content length? Not sure if that's a particularly large priority
+				match get_header( "Transfer-Encoding", req.headers ) {
+					Some( v ) if v != b"identity" => {
+						send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Unsupported transfer encoding" ) ) ).await?;
+						return Ok( () )
+					}
+					_ => ()
+				}
+				
 				// Check if client sent Expect: 100-continue in header, if that's the case we will need to return 100 in status code
 				// Without it, it means that client has no body to send, we will stop if that's the case
 				match get_header( "Expect", req.headers ) {
-					Some(v) => {
-						match std::str::from_utf8(v) {
-							Ok(parsed) => {
-								if parsed == "100-continue" {
-									send_continue( &mut stream, &server_id ).await.ok();
-								} else {
-									// Some unknown value is passed
-									send_bad_request(&mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Expected 100-continue in Expect header" ) ) ).await?;
-									return Ok( () )
-								}
-							},
-							Err(_) => {
-								// Some unknown unicode used. STOP
-								send_bad_request(&mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Unknown unicode used in headers" ) ) ).await?;
-								return Ok( () )
-							}
-						}
-					},
+					Some( b"100-continue" ) => {
+						send_continue( &mut stream, &server_id ).await?;
+					}
+					Some( _ ) => {
+						send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Expected 100-continue in Expect header" ) ) ).await?;
+						return Ok( () )
+					}
 					None => {
-						send_bad_request(&mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "PUT request must come with Expect header" ) ) ).await?;
+						send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "PUT request must come with Expect header" ) ) ).await?;
 						return Ok( () )
 					}
 				}
@@ -486,14 +448,45 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			serv.sources.insert( path, arc.clone() );
 			drop( serv );
 
-			println!( "Mounted source on {}", arc.read().await.mountpoint );
+			println!( "Mounted source on {} via {}", arc.read().await.mountpoint, method );
 
 			if buf.len() < body_offset {
 				let slice = &buf[ body_offset .. ];
 				broadcast_to_clients( &arc, slice.to_vec(), queue_size, burst_size ).await;
 			}
 
-			source_stream(&mut stream, &source_timeout, &arc, queue_size, burst_size).await.ok();
+			// Listen for bytes
+			while {
+				// Read the incoming stream data until it closes
+				let mut buf = [ 0; 1024 ];
+				let read = match timeout( Duration::from_millis( source_timeout ), async {
+					match stream.read( &mut buf ).await {
+						Ok( n ) => n,
+						Err( e ) => {
+							println!( "An error occured while reading stream data: {}", e );
+							0
+						}
+					}
+				} ).await {
+					Ok( n ) => n,
+					Err( _ ) => {
+						println!( "A source timed out: {}", arc.read().await.mountpoint );
+						0
+					}
+				};
+		
+				if read != 0 {
+					// Get the slice
+					let mut slice: Vec< u8 > = Vec::new();
+					slice.extend_from_slice( &buf[ .. read  ] );
+		
+					broadcast_to_clients( &arc, slice, queue_size, burst_size ).await;
+					arc.read().await.stats.write().await.bytes_read += read;
+				}
+		
+				// Check if the source needs to be disconnected
+				read != 0 && !arc.read().await.disconnect_flag
+			}  {}
 
 			let mut source = arc.write().await;
 			let fallback = source.fallback.clone();
@@ -1445,13 +1438,14 @@ fn extract_queries( url: &str ) -> ( &str, Option< Vec< Query > > ) {
 
 fn populate_properties( properties: &mut IcyProperties, headers: &[ httparse::Header< '_ > ] ) {
 	for header in headers {
-		let name = header.name;
+		let name = header.name.to_lowercase();
+		let name = name.as_str();
 		let val = std::str::from_utf8( header.value ).unwrap_or( "" );
 
 		// There's a nice list here: https://github.com/ben221199/MediaCast
 		// Although, these were taken directly from Icecast's source: https://github.com/xiph/Icecast-Server/blob/master/src/source.c
 		match name {
-			"User-Agent" => properties.uagent = Some( val.to_string() ),
+			"user-agent" => properties.uagent = Some( val.to_string() ),
 			"ice-public" | "icy-pub" | "x-audiocast-public" | "icy-public" => properties.public = val.parse::< usize >().unwrap_or( 0 ) == 1,
 			"ice-name" | "icy-name" | "x-audiocast-name" => properties.name = Some( val.to_string() ),
 			"ice-description" | "icy-description" | "x-audiocast-description" => properties.description = Some( val.to_string() ),
@@ -1464,8 +1458,9 @@ fn populate_properties( properties: &mut IcyProperties, headers: &[ httparse::He
 }
 
 fn get_header< 'a >( key: &str, headers: &[ httparse::Header< 'a > ] ) -> Option< &'a [ u8 ] > {
+	let key = key.to_lowercase();
 	for header in headers {
-		if header.name == key {
+		if header.name.to_lowercase() == key {
 			return Some( header.value )
 		}
 	}
