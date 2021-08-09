@@ -140,6 +140,18 @@ struct SourceStats {
 	peak_listeners: usize
 }
 
+#[ derive( Serialize, Deserialize, Clone ) ]
+struct MasterServer {
+	host: String,
+	port: u16,
+	update_interval: u64
+}
+
+#[ derive( Serialize, Deserialize, Clone ) ]
+struct MasterMounts {
+	mounts: Vec<String>,
+}
+
 // TODO Add permissions
 #[ derive( Serialize, Deserialize, Clone ) ]
 struct Credential {
@@ -184,7 +196,8 @@ struct ServerProperties {
 	#[ serde( default = "default_property_limits" ) ]
 	limits: ServerLimits,
 	#[ serde( default = "default_property_users" ) ]
-	users: Vec< Credential >
+	users: Vec< Credential >,
+	master_server: Option< MasterServer >
 }
 
 impl ServerProperties {
@@ -198,7 +211,8 @@ impl ServerProperties {
 			location: default_property_location(),
 			description: default_property_description(),
 			limits: default_property_limits(),
-			users: default_property_users()
+			users: default_property_users(),
+			master_server: None
 		}
 	}
 }
@@ -241,52 +255,78 @@ impl Server {
 	}
 }
 
-async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStream ) -> Result< (), Box< dyn Error > > {
+async fn handle_connection<'a>( server: Arc< RwLock< Server > >, mut stream: TcpStream, relay: Option<(&[ httparse::Header< '_ > ], &str)> ) -> Result< (), Box< dyn Error > > {
 	let mut buf = Vec::new();
 	let mut buffer = [ 0; 512 ];
 
 	let header_timeout = server.read().await.properties.limits.header_timeout;
 
-	// Add a timeout
-	match timeout( Duration::from_millis( header_timeout ), async {
-		// Get the header
-		while {
-			let mut headers = [ httparse::EMPTY_HEADER; 32 ];
-			let mut req = httparse::Request::new( &mut headers );
-			match stream.read( &mut buffer ).await {
-				Ok( read ) => buf.extend_from_slice( &buffer[ .. read ] ),
-				Err( e ) => {
-					println!( "An error occured while reading a request: {}", e );
-					return Err( e )
-				}
-			}
+	let method;
+	let path;
+	let queries;
+	let mut _headers = [ httparse::EMPTY_HEADER; 32 ];
+	let mut req;
+	let headers: &[ httparse::Header< '_ > ];
+	let body_offset: usize;
 
-			match req.parse( &buf ) {
-				Ok( res ) => res.is_partial(),
-				Err( e ) => {
-					println!( "An error occured while parsing a request: {}", e );
-					return Err( std::io::Error::new( ErrorKind::Other, "Failed to parse an invalid request" ) )
-				}
-			}
-		} {}
+	let mut is_relay = false;
 
-		Ok( () )
-	} ).await {
-		Ok( Err( _ ) ) => return Ok( () ),
-		Ok( _ ) => (),
-		Err( _ ) => {
-			println!( "An incoming request failed to complete in time" );
-			return Ok( () )
+	if relay.is_none() {
+		// Add a timeout
+		match timeout( Duration::from_millis( header_timeout ), async {
+			// Get the header
+			while {
+				let mut headers = [ httparse::EMPTY_HEADER; 32 ];
+				let mut req = httparse::Request::new( &mut headers );
+				match stream.read( &mut buffer ).await {
+					Ok( read ) => buf.extend_from_slice( &buffer[ .. read ] ),
+					Err( e ) => {
+						println!( "An error occured while reading a request: {}", e );
+						return Err( e )
+					}
+				}
+
+				match req.parse( &buf ) {
+					Ok( res ) => res.is_partial(),
+					Err( e ) => {
+						println!( "An error occured while parsing a request: {}", e );
+						return Err( std::io::Error::new( ErrorKind::Other, "Failed to parse an invalid request" ) )
+					}
+				}
+			} {}
+
+			Ok( () )
+		} ).await {
+			Ok( Err( _ ) ) => return Ok( () ),
+			Ok( _ ) => (),
+			Err( _ ) => {
+				println!( "An incoming request failed to complete in time" );
+				return Ok( () )
+			}
 		}
+
+		req = httparse::Request::new( &mut _headers );
+		body_offset = req.parse( &buf ).unwrap().unwrap();
+
+		method = req.method.unwrap();
+
+		let tuple = extract_queries( req.path.unwrap() );
+		let base_path = tuple.0;
+		queries		  = tuple.1;
+		path = path_clean::clean( base_path );
+		headers = req.headers.as_ref();
+
+	} else {
+		let relay_info = relay.unwrap();
+		headers = relay_info.0;
+		path	= relay_info.1.to_owned();
+		method  = "SOURCE";
+		// since we will always stop after reading header only body offset is 0
+		body_offset = 0;
+		queries = None;
+
+		is_relay = true;
 	}
-
-	let mut headers = [ httparse::EMPTY_HEADER; 32 ];
-	let mut req = httparse::Request::new( &mut headers );
-	let body_offset = req.parse( &buf ).unwrap().unwrap();
-
-	let method = req.method.unwrap();
-	let ( base_path, queries ) = extract_queries( req.path.unwrap() );
-	let path = path_clean::clean( base_path );
 
 	let server_id = {
 		server.read().await.properties.server_id.clone()
@@ -295,17 +335,19 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 	match method {
 		// Some info about the protocol is provided here: https://gist.github.com/ePirat/adc3b8ba00d85b7e3870
 		"SOURCE" | "PUT" => {
-			// Check for authorization
-			if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
-				if !validate_user( &server.read().await.properties, name, pass ) {
-					// Invalid user/pass provided
-					send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=urf-8", "Invalid credentials" ) ) ).await?;
+			if !is_relay {
+				// Check for authorization
+				if let Some( ( name, pass ) ) = get_basic_auth( headers ) {
+					if !validate_user( &server.read().await.properties, name, pass ) {
+						// Invalid user/pass provided
+						send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=urf-8", "Invalid credentials" ) ) ).await?;
+						return Ok( () )
+					}
+				} else {
+					// No auth, return and close
+					send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=urf-8", "You need to authenticate" ) ) ).await?;
 					return Ok( () )
 				}
-			} else {
-				// No auth, return and close
-				send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=urf-8", "You need to authenticate" ) ) ).await?;
-				return Ok( () )
 			}
 
 			// http://example.com/radio == http://example.com/radio/
@@ -351,7 +393,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 
 			// Sources must have a content type
 			// Maybe the type that is served should be checked?
-			let mut properties = match get_header( "Content-Type", req.headers ) {
+			let mut properties = match get_header( "Content-Type", headers ) {
 				Some( content_type ) => IcyProperties::new( std::str::from_utf8( content_type ).unwrap().to_string() ),
 				None => {
 					send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "No Content-type given" ) ) ).await?;
@@ -367,13 +409,13 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			}
 
 			// Check if the max number of sources has been reached
-			if serv.sources.len() > serv.properties.limits.sources {
+			if is_relay && serv.sources.len() > serv.properties.limits.sources {
 				send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Too many sources connected" ) ) ).await?;
 				return Ok( () )
 			}
 
 			// Parse the headers for the source properties
-			populate_properties( &mut properties, req.headers );
+			populate_properties( &mut properties, headers );
 
 			if method == "SOURCE" {
 				// Give an 200 OK response
@@ -383,17 +425,17 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				// No support for chunked or encoding ATM
 				// TODO Add support for transfer encoding options as specified here: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Transfer-Encoding
 				// TODO Also potentially add support for content length? Not sure if that's a particularly large priority
-				match get_header( "Transfer-Encoding", req.headers ) {
+				match get_header( "Transfer-Encoding", headers ) {
 					Some( v ) if v != b"identity" => {
 						send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Unsupported transfer encoding" ) ) ).await?;
 						return Ok( () )
 					}
 					_ => ()
 				}
-				
+
 				// Check if client sent Expect: 100-continue in header, if that's the case we will need to return 100 in status code
 				// Without it, it means that client has no body to send, we will stop if that's the case
-				match get_header( "Expect", req.headers ) {
+				match get_header( "Expect", headers ) {
 					Some( b"100-continue" ) => {
 						send_continue( &mut stream, &server_id ).await?;
 					}
@@ -474,16 +516,16 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 						0
 					}
 				};
-		
+
 				if read != 0 {
 					// Get the slice
 					let mut slice: Vec< u8 > = Vec::new();
 					slice.extend_from_slice( &buf[ .. read  ] );
-		
+
 					broadcast_to_clients( &arc, slice, queue_size, burst_size ).await;
 					arc.read().await.stats.write().await.bytes_read += read;
 				}
-		
+
 				// Check if the source needs to be disconnected
 				read != 0 && !arc.read().await.disconnect_flag
 			}  {}
@@ -559,7 +601,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				}
 
 				// Check if metadata is enabled
-				let meta_enabled = get_header( "Icy-MetaData", req.headers ).unwrap_or( b"0" ) == b"1";
+				let meta_enabled = get_header( "Icy-MetaData", headers ).unwrap_or( b"0" ) == b"1";
 
 				// Reply with a 200 OK
 				send_listener_ok( &mut stream, &server_id, &source.properties, meta_enabled, serv.properties.metaint ).await?;
@@ -579,7 +621,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				let properties = ClientProperties {
 					id: client_id,
 					uagent: {
-						if let Some( arr ) = get_header( "User-Agent", req.headers ) {
+						if let Some( arr ) = get_header( "User-Agent", headers ) {
 							if let Ok( parsed ) = std::str::from_utf8( arr ) {
 								Some( parsed.to_string() )
 							} else {
@@ -746,7 +788,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					"/admin/metadata" => {
 						let serv = server.read().await;
 						// Check for authorization
-						if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
+						if let Some( ( name, pass ) ) = get_basic_auth( headers ) {
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
@@ -792,7 +834,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					"/admin/listclients" => {
 						let serv = server.read().await;
 						// Check for authorization
-						if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
+						if let Some( ( name, pass ) ) = get_basic_auth( headers ) {
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
@@ -843,7 +885,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					"/admin/fallbacks" => {
 						let serv = server.read().await;
 						// Check for authorization
-						if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
+						if let Some( ( name, pass ) ) = get_basic_auth( headers ) {
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
@@ -882,7 +924,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					"/admin/moveclients" => {
 						let serv = server.read().await;
 						// Check for authorization
-						if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
+						if let Some( ( name, pass ) ) = get_basic_auth( headers ) {
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
@@ -924,7 +966,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					"/admin/killclient" => {
 						let serv = server.read().await;
 						// Check for authorization
-						if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
+						if let Some( ( name, pass ) ) = get_basic_auth( headers ) {
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
@@ -964,7 +1006,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					"/admin/killsource" => {
 						let serv = server.read().await;
 						// Check for authorization
-						if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
+						if let Some( ( name, pass ) ) = get_basic_auth( headers ) {
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
@@ -999,7 +1041,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					"/admin/listmounts" => {
 						let serv = server.read().await;
 						// Check for authorization
-						if let Some( ( name, pass ) ) = get_basic_auth( req.headers ) {
+						if let Some( ( name, pass ) ) = get_basic_auth( headers ) {
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
@@ -1153,6 +1195,203 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 	}
 
 	Ok( () )
+}
+
+async fn read_headers( stream: &mut TcpStream, header_timeout: &u64, buf: &mut Vec<u8> ) -> Result< (), Box< dyn Error > > {
+	match timeout( Duration::from_millis( *header_timeout ), async {
+		// Get the header
+		let mut headers = [ httparse::EMPTY_HEADER; 32 ];
+		let mut req 	= httparse::Response::new( &mut headers );
+		let mut byte	= [ 0; 1 ];
+
+		loop {
+			match stream.read( &mut byte ).await {
+				Ok( _ ) => {
+					buf.extend_from_slice(&byte);
+					// checking if double crlf is in header
+					if buf.windows(4).any(|window| window == b"\r\n\r\n") { // end of header
+						break;
+					} else if buf.len() > 5000 {
+						// Stop any potential attack
+						return Err( std::io::Error::new( ErrorKind::Other, "Master node sent a long header" ) )
+					}
+				},
+				Err( e ) => {
+					println!( "An error occured while reading a request: {}", e );
+					return Err( e )
+				}
+			}
+		}
+
+		match req.parse( &buf ) {
+			Ok( _ ) => (),
+			Err( e ) => {
+				println!( "An error occured while parsing a request: {}", e );
+				return Err( std::io::Error::new( ErrorKind::Other, "Failed to parse an invalid request" ) )
+			}
+		};
+		Ok( () )
+	} ).await {
+		Ok( Err( e ) ) => return Err( Box::new(e) ),
+		Ok( _ ) => (),
+		Err( e ) => {
+			println!( "An incoming request failed to complete in time" );
+			return Err( Box::new(e) )
+		}
+	};
+	Ok( () )
+}
+
+async fn master_server_mountpoints( server: &Arc< RwLock< Server > >, master_info: &MasterServer ) -> Result< Vec<String>, Box< dyn Error > > {
+	// Get all master mountpoints
+	let server_id = {
+		server.read().await.properties.server_id.clone()
+	};
+	let mut sock = TcpStream::connect( format!("{}:{}", master_info.host, master_info.port) ).await?;
+	sock.write_all(format!("GET /api/serverinfo HTTP/1.0\r\nUser-Agent: {}\r\nConnection: Closed\r\n\r\n", server_id).as_bytes()).await?;
+
+	let mut buf = Vec::new();
+	let header_timeout = server.read().await.properties.limits.header_timeout;
+	// read  headers from client
+	read_headers(&mut sock, &header_timeout, &mut buf).await?;
+
+	let mut headers = [ httparse::EMPTY_HEADER; 32 ];
+	let mut res = httparse::Response::new( &mut headers );
+
+	res.parse( &buf ).unwrap().unwrap();
+	let mut len = match get_header( "Content-Length", res.headers ) {
+		Some( val ) => {
+			let parsed = std::str::from_utf8(val)?;
+			parsed.parse::<usize>()?
+		},
+		None => {
+			return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!("Error retrieving mountpoints from master node {}:{}", master_info.host, master_info.port) ) ) )
+		}
+	};
+
+	match res.code {
+		Some( v ) => {
+			if v != 200 {
+				return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!("Access to get master mountpoints denied by {}:{}", master_info.host, master_info.port) ) ) )
+			}
+		}
+		None => {
+			return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!("Can't parse header sent by {}:{}", master_info.host, master_info.port) ) ) )
+		}
+	}
+
+	let source_timeout = server.read().await.properties.limits.source_timeout;
+
+	let mut json_body = String::new();
+
+	loop {
+		// Read the incoming stream data until it closes
+		let read = match timeout( Duration::from_millis( source_timeout ), async {
+			match sock.read( &mut buf ).await {
+				Ok( n ) => n,
+				Err( e ) => {
+					println!( "An error occured while reading stream data: {}", e );
+					0
+				}
+			}
+		} ).await {
+			Ok( n ) => n,
+			Err( _ ) => {
+				println!( "Connection to {}:{} timed out", master_info.host, master_info.port );
+				0
+			}
+		};
+
+		if read == 0 { // Error occured or timeout
+			return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Error getting mountpoints from master" ) ) )
+		} else if read != 0 {
+			len -= read;
+			json_body.push_str(std::str::from_utf8(&buf[..read])?);
+			if len == 0 {
+				break;
+			}
+		}
+	}
+	// we either will found mounts or client is not an icecast node?
+	let mounts: MasterMounts = serde_json::from_str( &json_body )?;
+
+	Ok( mounts.mounts )
+}
+
+async fn relay_mountpoint( server: Arc< RwLock< Server > >, host: &str, port: u16, mount: &str ) -> Result< (), Box< dyn Error > > {
+	let server_id = {
+		server.read().await.properties.server_id.clone()
+	};
+	let mut sock = TcpStream::connect( format!("{}:{}", host, port) ).await?;
+	sock.write_all(format!("GET /{} HTTP/1.0\r\nUser-Agent: {}\r\nConnection: Closed\r\n\r\n", mount, server_id).as_bytes()).await?;
+
+	let mut buf = Vec::new();
+	let header_timeout = server.read().await.properties.limits.header_timeout;
+	// read headers from server
+	read_headers(&mut sock, &header_timeout, &mut buf).await?;
+
+	let mut headers = [ httparse::EMPTY_HEADER; 32 ];
+	let mut res = httparse::Response::new( &mut headers );
+	res.parse( &buf ).unwrap().unwrap();
+
+	match res.code {
+		Some( v ) => {
+			if v != 200 {
+				return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!("Access to get mount {} in {}:{}", mount, host, port) ) ) )
+			}
+		}
+		None => {
+			return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!("Can't parse header sent by {}:{}", host, port) ) ) )
+		}
+	}
+
+	// checking if our peer is really an icecast server
+	match get_header( "icy-name", res.headers ) {
+		Some( _ ) => (),
+		None => {
+			return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!("Is {}:{} an icecast server?", host, port) ) ) )
+		}
+	};
+
+
+	handle_connection( server, sock, Some( (&res.headers, mount) ) ).await?;
+
+	Ok( () )
+}
+
+async fn slave_node( server: Arc< RwLock< Server > > ) -> Result< (), Box< dyn Error > > {
+	/*
+		Master-slave polling
+		We will retrieve mountpoints from master node every update_interval and mount them in slave node.
+		If mountpoint already exists in slave node (ie. a source uses same mountpoint that also exists in master node),
+		then we will ignore that mountpoint from master
+	*/
+	let master_info;
+	{
+		let master_opt = server.read().await.properties.master_server.clone();
+		master_info    = Arc::new(master_opt.unwrap());
+	}
+
+	loop {
+		// first we retrieve mountpoints from master
+		match master_server_mountpoints( &server, &master_info ).await {
+			Ok( mounts ) => {
+				for mount in mounts {
+					// trying to mount all mounts from master
+					let server_clone = server.clone();
+					let master_info_clone = master_info.clone();
+					tokio::spawn( async move {
+						relay_mountpoint(server_clone, &master_info_clone.host, master_info_clone.port, &mount).await.ok();
+					} );
+				}
+			},
+			Err(e) => {
+				println!("Error while fetching mountpoints: {}", e);
+			}
+		}
+		// update interval
+		tokio::time::sleep(tokio::time::Duration::from_secs(master_info.update_interval)).await;
+	}
 }
 
 async fn broadcast_to_clients( source: &Arc< RwLock< Source > >, data: Vec< u8 >, queue_size: usize, burst_size: usize ) {
@@ -1564,7 +1803,7 @@ async fn main() {
 		}
 	};
 	println!( "Using config path {}", config_location );
-	
+
 	match std::fs::read_to_string( &config_location ) {
 		Ok( contents ) => {
 			println!( "Attempting to parse the config" );
@@ -1578,7 +1817,7 @@ async fn main() {
 		}
 		Err( e ) => println!( "An error occured while trying to read the config: {}", e ),
 	}
-	
+
 	// Create or update the current config
 	match File::create( &config_location ) {
 		Ok( file ) => {
@@ -1608,13 +1847,21 @@ async fn main() {
 	println!( "Using BURST SIZE     : {}", properties.limits.burst_size );
 	println!( "Using HEADER TIMEOUT : {}", properties.limits.header_timeout );
 	println!( "Using SOURCE TIMEOUT : {}", properties.limits.source_timeout );
+	match &properties.master_server {
+		Some( v ) => {
+			println!("Master server host   : {}", v.host);
+			println!("Master server port   : {}", v.port);
+			println!("Master update time   : {} seconds", v.update_interval);
+		},
+		None => ()
+	}
 	for ( mount, limit ) in &properties.limits.source_limits {
 		println!( "Using limits for {}:", mount );
 		println!( "      CLIENT LIMIT   : {}", limit.clients );
 		println!( "      SOURCE TIMEOUT : {}", limit.source_timeout );
 		println!( "      BURST SIZE     : {}", limit.burst_size );
 	}
-	
+
 	if properties.users.is_empty() {
 		println!( "At least one user must be configured in the config!" );
 	} else {
@@ -1623,22 +1870,30 @@ async fn main() {
 		match TcpListener::bind( SocketAddr::new( IpAddr::V4( Ipv4Addr::new( 127, 0, 0, 1 ) ), properties.port ) ).await {
 			Ok( listener ) => {
 				let server = Arc::new( RwLock::new( Server::new( properties ) ) );
-				
+
 				if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
 					println!( "The server has started on {}", fmt_http_date( SystemTime::now() ) );
 					server.write().await.stats.start_time = time.as_secs();
 				} else {
 					println!( "Unable to capture when the server started!" );
 				}
-				
-				println!( "Listening..." );				
+
+				if server.read().await.properties.master_server.is_some() {
+					// Start our slave node
+					let server_clone = server.clone();
+					tokio::spawn( async move {
+						slave_node( server_clone ).await.ok();
+					} );
+				}
+
+				println!( "Listening..." );
 				loop {
 					match listener.accept().await {
 						Ok( ( socket, addr ) ) => {
 							let server_clone = server.clone();
-							
+
 							tokio::spawn( async move {
-								if let Err( e ) = handle_connection( server_clone, socket ).await {
+								if let Err( e ) = handle_connection( server_clone, socket, None ).await {
 									println!( "An error occured while handling a connection from {}: {}", addr, e );
 								}
 							} );
