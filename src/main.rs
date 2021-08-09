@@ -1383,7 +1383,6 @@ async fn slave_node( server: Arc< RwLock< Server > > ) -> Result< (), Box< dyn E
 		}
 		if !mounts.is_empty() {
 			for mount in mounts {
-				println!("{:?} {}", server.read().await.sources.keys(), mount);
 				if server.read().await.sources.contains_key( &mount ) {
 					// mount already exists
 					continue;
