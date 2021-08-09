@@ -140,7 +140,7 @@ struct SourceStats {
 	peak_listeners: usize
 }
 
-#[ derive( Serialize, Deserialize, Clone, Debug ) ]
+#[ derive( Serialize, Deserialize, Clone ) ]
 struct MasterServer {
 	host: String,
 	port: u16,
