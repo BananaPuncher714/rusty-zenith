@@ -1833,7 +1833,7 @@ async fn main() {
 		}
 		Err( e ) => println!( "An error occured while to create the config file: {}", e ),
 	}
-	println!("{:?}", properties.master_server);
+
 	println!( "Using PORT           : {}", properties.port );
 	println!( "Using METAINT        : {}", properties.metaint );
 	println!( "Using SERVER ID      : {}", properties.server_id );
