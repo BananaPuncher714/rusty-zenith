@@ -1374,20 +1374,25 @@ async fn slave_node( server: Arc< RwLock< Server > > ) -> Result< (), Box< dyn E
 
 	loop {
 		// first we retrieve mountpoints from master
+		let mut mounts = Vec::new();
 		match master_server_mountpoints( &server, &master_info ).await {
-			Ok( mounts ) => {
-				for mount in mounts {
-					// trying to mount all mounts from master
-					let server_clone = server.clone();
-					let master_info_clone = master_info.clone();
-					tokio::spawn( async move {
-						relay_mountpoint(server_clone, &master_info_clone.host, master_info_clone.port, &mount).await.ok();
-					} );
-				}
-			},
+			Ok( v ) => mounts.extend(v),
 			Err(e) => {
 				println!("Error while fetching mountpoints: {}", e);
 			}
+		}
+		for mount in mounts {
+			println!("{:?} {}", server.read().await.sources.keys(), mount);
+			if server.read().await.sources.contains_key( &mount ) {
+				// mount already exists
+				continue;
+			}
+			// trying to mount all mounts from master
+			let server_clone = server.clone();
+			let master_info_clone = master_info.clone();
+			tokio::spawn( async move {
+				relay_mountpoint(server_clone, &master_info_clone.host, master_info_clone.port, &mount).await.ok();
+			} );
 		}
 		// update interval
 		tokio::time::sleep(tokio::time::Duration::from_secs(master_info.update_interval)).await;
