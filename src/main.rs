@@ -35,8 +35,10 @@ const LOCATION: &str = "1.048596";
 // Description of the internet radio
 const DESCRIPTION: &str = "Yet Another Internet Radio";
 
-// How many sources can be connected, in total
+// How many regular sources, not including relays
 const SOURCES: usize = 4;
+// How many sources can be connected, in total
+const MAX_SOURCES: usize = 4;
 // How many clients can be connected, in total
 const CLIENTS: usize = 400;
 // How many bytes a client can have queued until they get disconnected
@@ -120,6 +122,8 @@ struct SourceLimits {
 	source_timeout: u64
 }
 
+// TODO Add something determining if a source is a relay, or any other kind of source, for that matter
+// TODO Implement hidden sources
 struct Source {
 	// Is setting the mountpoint in the source really useful, since it's not like the source has any use for it
 	mountpoint: String,
@@ -167,11 +171,21 @@ struct SourceStats {
 	peak_listeners: usize
 }
 
+// TODO Add a list of "relay" structs
+// Relay structs should have an auth of their own, if provided
+// TODO Add basic authorization
 #[ derive( Serialize, Deserialize, Clone ) ]
 struct MasterServer {
+	#[ serde( default = "default_property_master_server_enabled" ) ]
+	enabled: bool,
+	#[ serde( default = "default_property_master_server_host" ) ]
 	host: String,
+	#[ serde( default = "default_property_master_server_port" ) ]
 	port: u16,
-	update_interval: u64
+	#[ serde( default = "default_property_master_server_update_interval" ) ]
+	update_interval: u64,
+	#[ serde( default = "default_property_master_server_relay_limit" ) ]
+	relay_limit: usize,
 }
 
 #[ derive( Serialize, Deserialize, Clone ) ]
@@ -179,19 +193,22 @@ struct MasterMounts {
 	mounts: Vec< String >,
 }
 
-// TODO Add permissions
+// TODO Add permissions, specifically source, admin, bypass client count, etc
 #[ derive( Serialize, Deserialize, Clone ) ]
 struct Credential {
 	username: String,
 	password: String
 }
 
+// Add a total source limit
 #[ derive( Serialize, Deserialize, Clone ) ]
 struct ServerLimits {
 	#[ serde( default = "default_property_limits_clients" ) ]
 	clients: usize,
 	#[ serde( default = "default_property_limits_sources" ) ]
 	sources: usize,
+	#[ serde( default = "default_property_limits_total_sources" ) ]
+	total_sources: usize,
 	#[ serde( default = "default_property_limits_queue_size" ) ]
 	queue_size: usize,
 	#[ serde( default = "default_property_limits_burst_size" ) ]
@@ -224,7 +241,8 @@ struct ServerProperties {
 	limits: ServerLimits,
 	#[ serde( default = "default_property_users" ) ]
 	users: Vec< Credential >,
-	master_server: Option< MasterServer >
+	#[ serde( default = "default_property_master_server" ) ]
+	master_server: MasterServer
 }
 
 impl ServerProperties {
@@ -239,7 +257,7 @@ impl ServerProperties {
 			description: default_property_description(),
 			limits: default_property_limits(),
 			users: default_property_users(),
-			master_server: None
+			master_server: default_property_master_server()
 		}
 	}
 }
@@ -263,10 +281,12 @@ impl ServerStats {
 	}
 }
 
-// TODO Add stats
 struct Server {
 	sources: HashMap< String, Arc< RwLock< Source > > >,
 	clients: HashMap< Uuid, ClientProperties >,
+	// TODO Find a better place to put these, for constant time fetching
+	source_count: usize,
+	relay_count: usize,
 	properties: ServerProperties,
 	stats: ServerStats
 }
@@ -276,6 +296,8 @@ impl Server {
 		Server{
 			sources: HashMap::new(),
 			clients: HashMap::new(),
+			source_count: 0,
+			relay_count: 0,
 			properties,
 			stats: ServerStats::new()
 		}
@@ -291,8 +313,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 		Ok( Err( _ ) ) => return Ok( () ),
 		Ok( _ ) => (),
 		Err( _ ) => {
-			println!( "An incoming request failed to complete in time" );
-			return Ok( () )
+			return Err( Box::new( std::io::Error::new( ErrorKind::Other, "An incoming request failed to complete in time" ) ) )
 		}
 	}
 
@@ -395,8 +416,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			}
 
 			// Check if the max number of sources has been reached
-			// TODO Check if the total limit has been reached
-			if serv.sources.len() > serv.properties.limits.sources {
+			if serv.source_count >= serv.properties.limits.sources || serv.sources.len() >= serv.properties.limits.total_sources {
 				send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Too many sources connected" ) ) ).await?;
 				return Ok( () )
 			}
@@ -451,6 +471,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			// Add to the server
 			let arc = Arc::new( RwLock::new( source ) );
 			serv.sources.insert( path, arc.clone() );
+			serv.source_count += 1;
 			drop( serv );
 
 			println!( "Mounted source on {} via {}", arc.read().await.mountpoint, method );
@@ -517,6 +538,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			// Clean up and remove the source
 			let mut serv = server.write().await;
 			serv.sources.remove( &source.mountpoint );
+			serv.source_count -= 1;
 			serv.stats.session_bytes_read += source.stats.read().await.bytes_read;
 
 			if method == "PUT" {
@@ -1155,108 +1177,6 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 	Ok( () )
 }
 
-#[ allow( clippy::map_entry ) ]
-async fn mount_relay( server: Arc< RwLock< Server > >, mut stream: TcpStream, source: Source ) -> Result< (), Box< dyn Error > > {
-	// TODO This code is almost an exact replica of the one used for regular source handling, although with a few differences
-	let mut serv = server.write().await;
-	// Check if the mountpoint is already in use
-	let path = source.mountpoint.clone();
-	// Not sure what clippy wants, https://rust-lang.github.io/rust-clippy/master/#map_entry
-	// The source is not needed if the map already has one. TODO Try using try_insert if it's stable in the future
-	if serv.sources.contains_key( &path ) {
-		// The error handling in this program is absolutely awful
-		Err( Box::new( std::io::Error::new( ErrorKind::Other, format!( "A source with the same mountpoint already exists: {}", path ) ) ) )
-	} else {
-		if serv.sources.len() > serv.properties.limits.sources {
-			return Err( Box::new( std::io::Error::new( ErrorKind::Other, "The server relay/source limit has been reached" ) ) );
-		}
-		
-		let queue_size = serv.properties.limits.queue_size;
-		let ( burst_size, source_timeout ) =  {
-			if let Some( limit ) = serv.properties.limits.source_limits.get( &path ) {
-				( limit.burst_size, limit.source_timeout )
-			} else {
-				( serv.properties.limits.burst_size, serv.properties.limits.header_timeout )
-			}
-		};
-
-		// Add to the server
-		let arc = Arc::new( RwLock::new( source ) );
-		serv.sources.insert( path, arc.clone() );
-		drop( serv );
-
-		println!( "Mounted relay on {}", arc.read().await.mountpoint );
-		
-		// Listen for bytes
-		while {
-			// Read the incoming stream data until it closes
-			let mut buf = [ 0; 1024 ];
-			let read = match timeout( Duration::from_millis( source_timeout ), async {
-				match stream.read( &mut buf ).await {
-					Ok( n ) => n,
-					Err( e ) => {
-						println!( "An error occured while reading stream data: {}", e );
-						0
-					}
-				}
-			} ).await {
-				Ok( n ) => n,
-				Err( _ ) => {
-					println!( "A relay timed out: {}", arc.read().await.mountpoint );
-					0
-				}
-			};
-
-			if read != 0 {
-				// Get the slice
-				let mut slice: Vec< u8 > = Vec::new();
-				slice.extend_from_slice( &buf[ .. read  ] );
-
-				broadcast_to_clients( &arc, slice, queue_size, burst_size ).await;
-				arc.read().await.stats.write().await.bytes_read += read;
-			}
-
-			// Check if the source needs to be disconnected
-			read != 0 && !arc.read().await.disconnect_flag
-		}  {}
-
-		let mut source = arc.write().await;
-		let fallback = source.fallback.clone();
-		if let Some( fallback_id ) = fallback {
-			if let Some( fallback_source ) = server.read().await.sources.get( &fallback_id ) {
-				println!( "Moving listeners from {} to {}", source.mountpoint, fallback_id );
-				let mut fallback = fallback_source.write().await;
-				for ( uuid, client ) in source.clients.drain() {
-					*client.read().await.source.write().await = fallback_id.clone();
-					fallback.clients.insert( uuid, client );
-				}
-			} else {
-				println!( "No fallback source {} found! Disconnecting listeners on {}", fallback_id, source.mountpoint );
-				for cli in source.clients.values() {
-					// Send an empty vec to signify the channel is closed
-					drop( cli.read().await.sender.write().await.send( Arc::new( Vec::new() ) ) );
-				}
-			}
-		} else {
-			// Disconnect each client by sending an empty buffer
-			println!( "Disconnecting listeners on {}", source.mountpoint );
-			for cli in source.clients.values() {
-				// Send an empty vec to signify the channel is closed
-				drop( cli.read().await.sender.write().await.send( Arc::new( Vec::new() ) ) );
-			}
-		}
-
-		// Clean up and remove the source
-		let mut serv = server.write().await;
-		serv.sources.remove( &source.mountpoint );
-		serv.stats.session_bytes_read += source.stats.read().await.bytes_read;
-		
-		println!( "Unmounted relay {}", source.mountpoint );
-		
-		Ok( () )
-	}
-}
-
 async fn read_http_message( stream: &mut TcpStream, buf: &mut Vec< u8 >, max_len: usize ) -> Result< (), Box< dyn Error > > {
 	let mut byte = [ 0; 1 ];
 	while buf.windows( 4 ).last() != Some( b"\r\n\r\n" ) {
@@ -1363,11 +1283,15 @@ async fn master_server_mountpoints( server: &Arc< RwLock< Server > >, master_inf
 	Ok( mounts.mounts )
 }
 
-async fn relay_mountpoint( server: Arc< RwLock< Server > >, host: &str, port: u16, mount: &str ) -> Result< (), Box< dyn Error > > {
+#[ allow( clippy::map_entry ) ]
+async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: MasterServer, mount: String ) -> Result< (), Box< dyn Error > > {
 	let server_id = {
 		server.read().await.properties.server_id.clone()
 	};
-	let mut sock = TcpStream::connect( format!("{}:{}", host, port) ).await?;
+	let host = master_server.host;
+	let port = master_server.port;
+	
+	let mut sock = TcpStream::connect( format!("{}:{}", host, port ) ).await?;
 	sock.write_all(format!("GET /{} HTTP/1.0\r\nUser-Agent: {}\r\nConnection: Closed\r\n\r\n", mount, server_id).as_bytes()).await?;
 
 	let mut buf = Vec::new();
@@ -1418,26 +1342,123 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, host: &str, port: u1
 
 	let source = Source::new( mount.to_string(), properties );
 
-	mount_relay( server, sock, source ).await
+	// TODO This code is almost an exact replica of the one used for regular source handling, although with a few differences
+	let mut serv = server.write().await;
+	// Check if the mountpoint is already in use
+	let path = source.mountpoint.clone();
+	// Not sure what clippy wants, https://rust-lang.github.io/rust-clippy/master/#map_entry
+	// The source is not needed if the map already has one. TODO Try using try_insert if it's stable in the future
+	if serv.sources.contains_key( &path ) {
+		// The error handling in this program is absolutely awful
+		Err( Box::new( std::io::Error::new( ErrorKind::Other, format!( "A source with the same mountpoint already exists: {}", path ) ) ) )
+	} else {
+		if serv.relay_count >= master_server.relay_limit || serv.sources.len() >= serv.properties.limits.total_sources {
+			return Err( Box::new( std::io::Error::new( ErrorKind::Other, "The server relay limit has been reached" ) ) );
+		} else if serv.sources.len() >= serv.properties.limits.total_sources {
+			return Err( Box::new( std::io::Error::new( ErrorKind::Other, "The server total source limit has been reached" ) ) );
+		}
+		
+		let queue_size = serv.properties.limits.queue_size;
+		let ( burst_size, source_timeout ) =  {
+			if let Some( limit ) = serv.properties.limits.source_limits.get( &path ) {
+				( limit.burst_size, limit.source_timeout )
+			} else {
+				( serv.properties.limits.burst_size, serv.properties.limits.header_timeout )
+			}
+		};
+
+		// Add to the server
+		let arc = Arc::new( RwLock::new( source ) );
+		serv.sources.insert( path, arc.clone() );
+		serv.relay_count += 1;
+		drop( serv );
+
+		println!( "Mounted relay on {}", arc.read().await.mountpoint );
+		
+		// Listen for bytes
+		while {
+			// Read the incoming stream data until it closes
+			let mut buf = [ 0; 1024 ];
+			let read = match timeout( Duration::from_millis( source_timeout ), async {
+				match sock.read( &mut buf ).await {
+					Ok( n ) => n,
+					Err( e ) => {
+						println!( "An error occured while reading stream data: {}", e );
+						0
+					}
+				}
+			} ).await {
+				Ok( n ) => n,
+				Err( _ ) => {
+					println!( "A relay timed out: {}", arc.read().await.mountpoint );
+					0
+				}
+			};
+
+			if read != 0 {
+				// Get the slice
+				let mut slice: Vec< u8 > = Vec::new();
+				slice.extend_from_slice( &buf[ .. read  ] );
+
+				// TODO Add metadata
+
+				broadcast_to_clients( &arc, slice, queue_size, burst_size ).await;
+				arc.read().await.stats.write().await.bytes_read += read;
+			}
+
+			// Check if the source needs to be disconnected
+			read != 0 && !arc.read().await.disconnect_flag
+		}  {}
+
+		let mut source = arc.write().await;
+		let fallback = source.fallback.clone();
+		if let Some( fallback_id ) = fallback {
+			if let Some( fallback_source ) = server.read().await.sources.get( &fallback_id ) {
+				println!( "Moving listeners from {} to {}", source.mountpoint, fallback_id );
+				let mut fallback = fallback_source.write().await;
+				for ( uuid, client ) in source.clients.drain() {
+					*client.read().await.source.write().await = fallback_id.clone();
+					fallback.clients.insert( uuid, client );
+				}
+			} else {
+				println!( "No fallback source {} found! Disconnecting listeners on {}", fallback_id, source.mountpoint );
+				for cli in source.clients.values() {
+					// Send an empty vec to signify the channel is closed
+					drop( cli.read().await.sender.write().await.send( Arc::new( Vec::new() ) ) );
+				}
+			}
+		} else {
+			// Disconnect each client by sending an empty buffer
+			println!( "Disconnecting listeners on {}", source.mountpoint );
+			for cli in source.clients.values() {
+				// Send an empty vec to signify the channel is closed
+				drop( cli.read().await.sender.write().await.send( Arc::new( Vec::new() ) ) );
+			}
+		}
+
+		// Clean up and remove the source
+		let mut serv = server.write().await;
+		serv.sources.remove( &source.mountpoint );
+		serv.relay_count -= 1;
+		serv.stats.session_bytes_read += source.stats.read().await.bytes_read;
+		
+		println!( "Unmounted relay {}", source.mountpoint );
+		
+		Ok( () )
+	}
 }
 
-async fn slave_node( server: Arc< RwLock< Server > > ) {
+async fn slave_node( server: Arc< RwLock< Server > >, master_server: MasterServer ) {
 	/*
 		Master-slave polling
 		We will retrieve mountpoints from master node every update_interval and mount them in slave node.
 		If mountpoint already exists in slave node (ie. a source uses same mountpoint that also exists in master node),
 		then we will ignore that mountpoint from master
 	*/
-	let master_info;
-	{
-		let master_opt = server.read().await.properties.master_server.clone();
-		master_info    = Arc::new(master_opt.unwrap());
-	}
-
 	loop {
 		// first we retrieve mountpoints from master
 		let mut mounts = Vec::new();
-		match master_server_mountpoints( &server, &master_info ).await {
+		match master_server_mountpoints( &server, &master_server ).await {
 			Ok( v ) => mounts.extend( v ),
 			Err( e ) => {
 				println!("Error while fetching mountpoints: {}", e);
@@ -1473,14 +1494,14 @@ async fn slave_node( server: Arc< RwLock< Server > > ) {
 			
 			// trying to mount all mounts from master
 			let server_clone = server.clone();
-			let master_info_clone = master_info.clone();
+			let master_clone = master_server.clone();
 			tokio::spawn( async move {
-				relay_mountpoint( server_clone, &master_info_clone.host, master_info_clone.port, &path ).await.ok();
+				relay_mountpoint( server_clone, master_clone, path ).await.ok();
 			} );
 		}
 		
 		// update interval
-		tokio::time::sleep(tokio::time::Duration::from_secs(master_info.update_interval)).await;
+		tokio::time::sleep(tokio::time::Duration::from_secs( master_server.update_interval ) ).await;
 	}
 }
 
@@ -1842,9 +1863,10 @@ fn default_property_host() -> String { HOST.to_string() }
 fn default_property_location() -> String { LOCATION.to_string() }
 fn default_property_description() -> String { DESCRIPTION.to_string() }
 fn default_property_users() -> Vec< Credential > { vec![ Credential{ username: "admin".to_string(), password: "hackme".to_string() }, Credential { username: "source".to_string(), password: "hackme".to_string() } ] }
-fn default_property_limits() -> ServerLimits { ServerLimits{
+fn default_property_limits() -> ServerLimits { ServerLimits {
 	clients: default_property_limits_clients(),
 	sources: default_property_limits_sources(),
+	total_sources: default_property_limits_total_sources(),
 	queue_size: default_property_limits_queue_size(),
 	burst_size: default_property_limits_burst_size(),
 	header_timeout: default_property_limits_header_timeout(),
@@ -1853,6 +1875,7 @@ fn default_property_limits() -> ServerLimits { ServerLimits{
 } }
 fn default_property_limits_clients() -> usize { CLIENTS }
 fn default_property_limits_sources() -> usize { SOURCES }
+fn default_property_limits_total_sources() -> usize { MAX_SOURCES }
 fn default_property_limits_queue_size() -> usize { QUEUE_SIZE }
 fn default_property_limits_burst_size() -> usize { BURST_SIZE }
 fn default_property_limits_header_timeout() -> u64 { HEADER_TIMEOUT }
@@ -1867,6 +1890,18 @@ fn default_property_limits_source_limits() -> HashMap< String, SourceLimits > {
 	} );
 	map
 }
+fn default_property_master_server() -> MasterServer { MasterServer {
+	enabled: default_property_master_server_enabled(),
+	host: default_property_master_server_host(),
+	port: default_property_master_server_port(),
+	update_interval: default_property_master_server_update_interval(),
+	relay_limit: default_property_master_server_relay_limit()
+} }
+fn default_property_master_server_enabled() -> bool { false }
+fn default_property_master_server_host() -> String { "localhost".to_string() }
+fn default_property_master_server_port() -> u16 { default_property_port() + 1 }
+fn default_property_master_server_update_interval() -> u64 { 120 }
+fn default_property_master_server_relay_limit() -> usize { SOURCES }
 
 #[ tokio::main ]
 async fn main() {
@@ -1924,29 +1959,30 @@ async fn main() {
 		Err( e ) => println!( "An error occured while to create the config file: {}", e ),
 	}
 
-	println!( "Using PORT           : {}", properties.port );
-	println!( "Using METAINT        : {}", properties.metaint );
-	println!( "Using SERVER ID      : {}", properties.server_id );
-	println!( "Using ADMIN          : {}", properties.admin );
-	println!( "Using HOST           : {}", properties.host );
-	println!( "Using LOCATION       : {}", properties.location );
-	println!( "Using DESCRIPTION    : {}", properties.description );
-	println!( "Using CLIENT LIMIT   : {}", properties.limits.clients );
-	println!( "Using SOURCE LIMIT   : {}", properties.limits.sources );
-	println!( "Using QUEUE SIZE     : {}", properties.limits.queue_size );
-	println!( "Using BURST SIZE     : {}", properties.limits.burst_size );
-	println!( "Using HEADER TIMEOUT : {}", properties.limits.header_timeout );
-	println!( "Using SOURCE TIMEOUT : {}", properties.limits.source_timeout );
-	if let Some( master_server ) = &properties.master_server {
-		println!( "Master server host   : {}", master_server.host );
-		println!( "Master server port   : {}", master_server.port );
-		println!( "Master update time   : {} seconds", master_server.update_interval );
+	println!( "Using PORT            : {}", properties.port );
+	println!( "Using METAINT         : {}", properties.metaint );
+	println!( "Using SERVER ID       : {}", properties.server_id );
+	println!( "Using ADMIN           : {}", properties.admin );
+	println!( "Using HOST            : {}", properties.host );
+	println!( "Using LOCATION        : {}", properties.location );
+	println!( "Using DESCRIPTION     : {}", properties.description );
+	println!( "Using CLIENT LIMIT    : {}", properties.limits.clients );
+	println!( "Using SOURCE LIMIT    : {}", properties.limits.sources );
+	println!( "Using QUEUE SIZE      : {}", properties.limits.queue_size );
+	println!( "Using BURST SIZE      : {}", properties.limits.burst_size );
+	println!( "Using HEADER TIMEOUT  : {}", properties.limits.header_timeout );
+	println!( "Using SOURCE TIMEOUT  : {}", properties.limits.source_timeout );
+	if properties.master_server.enabled {
+		println!( "Using a master server:" );
+		println!( "      HOST            : {}", &properties.master_server.host );
+		println!( "      PORT            : {}", &properties.master_server.port );
+		println!( "      UPDATE INTERVAL : {} seconds", &properties.master_server.update_interval );
 	}
 	for ( mount, limit ) in &properties.limits.source_limits {
 		println!( "Using limits for {}:", mount );
-		println!( "      CLIENT LIMIT   : {}", limit.clients );
-		println!( "      SOURCE TIMEOUT : {}", limit.source_timeout );
-		println!( "      BURST SIZE     : {}", limit.burst_size );
+		println!( "      CLIENT LIMIT    : {}", limit.clients );
+		println!( "      SOURCE TIMEOUT  : {}", limit.source_timeout );
+		println!( "      BURST SIZE      : {}", limit.burst_size );
 	}
 
 	if properties.users.is_empty() {
@@ -1965,11 +2001,12 @@ async fn main() {
 					println!( "Unable to capture when the server started!" );
 				}
 
-				if server.read().await.properties.master_server.is_some() {
+				let master_server = server.read().await.properties.master_server.clone();
+				if master_server.enabled {
 					// Start our slave node
 					let server_clone = server.clone();
 					tokio::spawn( async move {
-						slave_node( server_clone ).await;
+						slave_node( server_clone, master_server ).await;
 					} );
 				}
 
