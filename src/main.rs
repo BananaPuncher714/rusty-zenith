@@ -188,11 +188,6 @@ struct MasterServer {
 	relay_limit: usize,
 }
 
-#[ derive( Serialize, Deserialize, Clone ) ]
-struct MasterMounts {
-	mounts: Vec< String >,
-}
-
 // TODO Add permissions, specifically source, admin, bypass client count, etc
 #[ derive( Serialize, Deserialize, Clone ) ]
 struct Credential {
@@ -310,25 +305,17 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 
 	// Add a timeout
 	match timeout( Duration::from_millis( header_timeout ), read_http_message( &mut stream, &mut message, 8192 ) ).await {
-		Ok( Err( _ ) ) => return Ok( () ),
+		Ok( Err( e ) ) => return Err( e ),
 		Ok( _ ) => (),
-		Err( _ ) => {
-			return Err( Box::new( std::io::Error::new( ErrorKind::Other, "An incoming request failed to complete in time" ) ) )
-		}
+		Err( _ ) => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "An incoming request failed to complete in time" ) ) )
 	}
 
 	let mut _headers = [ httparse::EMPTY_HEADER; 32 ];
 	let mut req = httparse::Request::new( &mut _headers );
 	match req.parse( &message ) {
 		Ok( Status::Complete( _ ) ) => (),
-		Ok( Status::Partial ) => {
-			println!( "A malformed header was received" );
-			return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Failed to parse an invalid request" ) ) )
-		}
-		Err( e ) => {
-			println!( "An error occured while parsing a request: {}", e );
-			return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Failed to parse an invalid request" ) ) )
-		}
+		Ok( Status::Partial ) => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Failed to parse an invalid request" ) ) ),
+		Err( e ) => return Err( Box::new( e ) )
 	}
 
 	let method = req.method.unwrap();
@@ -1190,10 +1177,7 @@ async fn read_http_message( stream: &mut TcpStream, buf: &mut Vec< u8 >, max_len
 			}
 			// Cannot be anything besides 0 at this point, but the compiler can't tell the difference
 			Ok( _ ) => return Ok( () ),
-			Err( e ) => {
-				println!( "An error occured while reading a request: {}", e );
-				return Err( Box::new( e ) )
-			}
+			Err( e ) => return Err( Box::new( e ) )
 		}
 	}
 	
@@ -1205,82 +1189,60 @@ async fn master_server_mountpoints( server: &Arc< RwLock< Server > >, master_inf
 	let server_id = {
 		server.read().await.properties.server_id.clone()
 	};
-	let mut sock = TcpStream::connect( format!("{}:{}", master_info.host, master_info.port) ).await?;
-	sock.write_all(format!("GET /api/serverinfo HTTP/1.0\r\nUser-Agent: {}\r\nConnection: Closed\r\n\r\n", server_id).as_bytes()).await?;
+	let mut sock = TcpStream::connect( format!( "{}:{}", master_info.host, master_info.port ) ).await?;
+	sock.write_all(format!( "GET /api/serverinfo HTTP/1.0\r\nUser-Agent: {}\r\nConnection: Closed\r\n\r\n", server_id ).as_bytes() ).await?;
 
-	let mut buf = Vec::new();
+	let mut message = Vec::new();
 	let header_timeout = server.read().await.properties.limits.header_timeout;
 	// read headers from client
-	match timeout( Duration::from_millis( header_timeout ), read_http_message( &mut sock, &mut buf, 8192 ) ).await {
-		Ok( Err( e ) ) => return Err( e ),
-		Ok( _ ) => (),
-		Err( e ) => {
-			println!( "An incoming request failed to complete in time" );
-			return Err( Box::new( e ) )
-		}
-	}
+	timeout( Duration::from_millis( header_timeout ), read_http_message( &mut sock, &mut message, 8192 ) ).await??;
 
 	let mut headers = [ httparse::EMPTY_HEADER; 32 ];
 	let mut res = httparse::Response::new( &mut headers );
 
-	match res.parse( &buf ) {
-		Ok( Status::Complete( _ ) ) => (),
-		Ok( Status::Partial ) => {
-			println!( "A malformed response was received" );
-			return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Failed to parse an invalid response" ) ) )
-		}
-		Err( e ) => return Err( Box::new( e ) ),
+	if res.parse( &message )? == Status::Partial {
+		return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Received an incomplete response" ) ) );
 	}
 
 	let mut len = match get_header( "Content-Length", res.headers ) {
 		Some( val ) => {
-			let parsed = std::str::from_utf8(val)?;
-			parsed.parse::<usize>()?
+			let parsed = std::str::from_utf8( val )?;
+			parsed.parse::< usize >()?
 		},
-		None => {
-			return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!("Error retrieving mountpoints from master node {}:{}", master_info.host, master_info.port) ) ) )
-		}
+		None => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "No Content-Length specified" ) ) )
 	};
 
 	match res.code {
 		Some( 200 ) => (),
-		Some( _ ) => return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!("Access to get master mountpoints denied by {}:{}", master_info.host, master_info.port) ) ) ),
-		None => return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!("Can't parse header sent by {}:{}", master_info.host, master_info.port) ) ) )
+		Some( code ) => return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!( "Invalid response: {}", code ) ) ) ),
+		None => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Missing response code" ) ) )
 	}
 
 	let source_timeout = server.read().await.properties.limits.source_timeout;
 
-	let mut json_body = String::new();
-
-	while len > 0 {
+	let mut json_slice = Vec::new();
+	let mut buf = [ 0; 512 ];
+	while len != 0 {
 		// Read the incoming stream data until it closes
-		let read = match timeout( Duration::from_millis( source_timeout ), async {
-			match sock.read( &mut buf ).await {
-				Ok( n ) => n,
-				Err( e ) => {
-					println!( "An error occured while reading stream data: {}", e );
-					0
-				}
-			}
-		} ).await {
-			Ok( n ) => n,
-			Err( _ ) => {
-				println!( "Connection to {}:{} timed out", master_info.host, master_info.port );
-				0
-			}
-		};
+		let read = timeout( Duration::from_millis( source_timeout ), sock.read( &mut buf ) ).await??;
 
-		if read == 0 { // Error occured or timeout
-			return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Error getting mountpoints from master" ) ) )
-		} else if read != 0 {
+		// Not guaranteed but most likely EOF or some premature closure
+		if read == 0 {
+			return Err( Box::new( std::io::Error::new( ErrorKind::UnexpectedEof, "Response body is less than specified" ) ) )
+		} else if read > len {
+			// Read too much?
+			return Err( Box::new( std::io::Error::new( ErrorKind::InvalidData, "Response body is larger than specified" ) ) );
+		} else {
 			len -= read;
-			json_body.push_str(std::str::from_utf8(&buf[..read])?);
+			json_slice.extend_from_slice( &buf[ .. read ] );
 		}
 	}
+	
+	#[ derive( Deserialize ) ]
+	struct MasterMounts { mounts: Vec< String > }
+	
 	// we either will found mounts or client is not an icecast node?
-	let mounts: MasterMounts = serde_json::from_str( &json_body )?;
-
-	Ok( mounts.mounts )
+	Ok( serde_json::from_slice::< MasterMounts >( &json_slice )?.mounts )
 }
 
 #[ allow( clippy::map_entry ) ]
@@ -1460,9 +1422,7 @@ async fn slave_node( server: Arc< RwLock< Server > >, master_server: MasterServe
 		let mut mounts = Vec::new();
 		match master_server_mountpoints( &server, &master_server ).await {
 			Ok( v ) => mounts.extend( v ),
-			Err( e ) => {
-				println!("Error while fetching mountpoints: {}", e);
-			}
+			Err( e ) => println!( "Error while fetching mountpoints from {}:{}: {}", master_server.host, master_server.port, e )
 		}
 		
 		for mount in mounts {
