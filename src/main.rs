@@ -50,6 +50,8 @@ const BURST_SIZE: usize = 65536;
 const HEADER_TIMEOUT: u64 = 15_000;
 // How long in milliseconds a source has to send something before being disconnected
 const SOURCE_TIMEOUT: u64 = 10_000;
+// The maximum size in bytes of an acceptable http message not including the body
+const HTTP_MAX_LENGTH: usize = 8192;
 
 #[ derive( Clone ) ]
 struct Query {
@@ -212,6 +214,8 @@ struct ServerLimits {
 	header_timeout: u64,
 	#[ serde( default = "default_property_limits_source_timeout" ) ]
 	source_timeout: u64,
+	#[ serde( default = "default_property_limits_http_max_length" ) ]
+	http_max_length: usize,
 	#[ serde( default = "default_property_limits_source_limits" ) ]
 	source_limits: HashMap< String, SourceLimits >
 }
@@ -301,21 +305,18 @@ impl Server {
 
 async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStream ) -> Result< (), Box< dyn Error > > {
 	let mut message = Vec::new();
-	let header_timeout = server.read().await.properties.limits.header_timeout;
+	let ( server_id, header_timeout, http_max_len ) = {
+		let properties = &server.read().await.properties;
+		( properties.server_id.clone(), properties.limits.header_timeout, properties.limits.http_max_length )
+	};
 
 	// Add a timeout
-	match timeout( Duration::from_millis( header_timeout ), read_http_message( &mut stream, &mut message, 8192 ) ).await {
-		Ok( Err( e ) ) => return Err( e ),
-		Ok( _ ) => (),
-		Err( _ ) => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "An incoming request failed to complete in time" ) ) )
-	}
+	timeout( Duration::from_millis( header_timeout ), read_http_message( &mut stream, &mut message, http_max_len ) ).await??;
 
 	let mut _headers = [ httparse::EMPTY_HEADER; 32 ];
 	let mut req = httparse::Request::new( &mut _headers );
-	match req.parse( &message ) {
-		Ok( Status::Complete( _ ) ) => (),
-		Ok( Status::Partial ) => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Failed to parse an invalid request" ) ) ),
-		Err( e ) => return Err( Box::new( e ) )
+	if req.parse( &message )? == Status::Partial {
+		return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Received an incomplete request" ) ) );
 	}
 
 	let method = req.method.unwrap();
@@ -323,10 +324,6 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 	let ( base_path, queries ) = extract_queries( req.path.unwrap() );
 	let path = path_clean::clean( base_path );
 	let headers = req.headers;
-
-	let server_id = {
-		server.read().await.properties.server_id.clone()
-	};
 
 	match method {
 		// Some info about the protocol is provided here: https://gist.github.com/ePirat/adc3b8ba00d85b7e3870
@@ -388,9 +385,9 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			// Sources must have a content type
 			// Maybe the type that is served should be checked?
 			let mut properties = match get_header( "Content-Type", headers ) {
-				Some( content_type ) => IcyProperties::new( String::from_utf8_lossy( content_type ).to_string() ),
+				Some( content_type ) => IcyProperties::new( std::str::from_utf8( content_type )?.to_string() ),
 				None => {
-					send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "No Content-type given" ) ) ).await?;
+					send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "No Content-type provided" ) ) ).await?;
 					return Ok( () )
 				}
 			};
@@ -471,7 +468,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					match stream.read( &mut buf ).await {
 						Ok( n ) => n,
 						Err( e ) => {
-							println!( "An error occured while reading stream data: {}", e );
+							println!( "An error occured while reading stream data from source {}: {}", arc.read().await.mountpoint, e );
 							0
 						}
 					}
@@ -1186,16 +1183,16 @@ async fn read_http_message( stream: &mut TcpStream, buf: &mut Vec< u8 >, max_len
 
 async fn master_server_mountpoints( server: &Arc< RwLock< Server > >, master_info: &MasterServer ) -> Result< Vec<String>, Box< dyn Error > > {
 	// Get all master mountpoints
-	let server_id = {
-		server.read().await.properties.server_id.clone()
+	let ( server_id, header_timeout, http_max_len ) = {
+		let properties = &server.read().await.properties;
+		( properties.server_id.clone(), properties.limits.header_timeout, properties.limits.http_max_length )
 	};
 	let mut sock = TcpStream::connect( format!( "{}:{}", master_info.host, master_info.port ) ).await?;
-	sock.write_all(format!( "GET /api/serverinfo HTTP/1.0\r\nUser-Agent: {}\r\nConnection: Closed\r\n\r\n", server_id ).as_bytes() ).await?;
+	sock.write_all( format!( "GET /api/serverinfo HTTP/1.0\r\nUser-Agent: {}\r\nConnection: Closed\r\n\r\n", server_id ).as_bytes() ).await?;
 
 	let mut message = Vec::new();
-	let header_timeout = server.read().await.properties.limits.header_timeout;
 	// read headers from client
-	timeout( Duration::from_millis( header_timeout ), read_http_message( &mut sock, &mut message, 8192 ) ).await??;
+	timeout( Duration::from_millis( header_timeout ), read_http_message( &mut sock, &mut message, http_max_len ) ).await??;
 
 	let mut headers = [ httparse::EMPTY_HEADER; 32 ];
 	let mut res = httparse::Response::new( &mut headers );
@@ -1247,55 +1244,42 @@ async fn master_server_mountpoints( server: &Arc< RwLock< Server > >, master_inf
 
 #[ allow( clippy::map_entry ) ]
 async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: MasterServer, mount: String ) -> Result< (), Box< dyn Error > > {
-	let server_id = {
-		server.read().await.properties.server_id.clone()
+	let ( server_id, header_timeout, http_max_len ) = {
+		let properties = &server.read().await.properties;
+		( properties.server_id.clone(), properties.limits.header_timeout, properties.limits.http_max_length )
 	};
 	let host = master_server.host;
 	let port = master_server.port;
 	
 	let mut sock = TcpStream::connect( format!("{}:{}", host, port ) ).await?;
-	sock.write_all(format!("GET /{} HTTP/1.0\r\nUser-Agent: {}\r\nConnection: Closed\r\n\r\n", mount, server_id).as_bytes()).await?;
+	sock.write_all( format!( "GET /{} HTTP/1.0\r\nUser-Agent: {}\r\nConnection: Closed\r\n\r\n", mount, server_id ).as_bytes( )).await?;
 
 	let mut buf = Vec::new();
-	let header_timeout = server.read().await.properties.limits.header_timeout;
 	// read headers from server
-	match timeout( Duration::from_millis( header_timeout ), read_http_message( &mut sock, &mut buf, 8192 ) ).await {
-		Ok( Err( e ) ) => return Err( e ),
-		Ok( _ ) => (),
-		Err( e ) => {
-			println!( "An incoming request failed to complete in time" );
-			return Err( Box::new( e ) )
-		}
-	}
+	timeout( Duration::from_millis( header_timeout ), read_http_message( &mut sock, &mut buf, http_max_len ) ).await??;
 
 	let mut headers = [ httparse::EMPTY_HEADER; 32 ];
 	let mut res = httparse::Response::new( &mut headers );
 	
-	match res.parse( &buf ) {
-		Ok( Status::Complete( _ ) ) => (),
-		Ok( Status::Partial ) => {
-			println!( "A malformed response was received" );
-			return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Failed to parse an invalid response" ) ) )
-		}
-		Err( e ) => return Err( Box::new( e ) ),
+	if res.parse( &buf )? == Status::Partial {
+		return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Received an incomplete response" ) ) );
 	}
 
 	match res.code {
 		Some( 200 ) => (),
-		Some( _ ) => return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!("Access to get mount {} denied by {}:{}", mount, host, port) ) ) ),
-		None => return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!( "Can't parse header sent by {}:{}", host, port ) ) ) )
+		Some( code ) => return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!( "Invalid response: {}", code ) ) ) ),
+		None => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Missing response code" ) ) )
 	}
 
 	// checking if our peer is really an icecast server
-	match get_header( "icy-name", res.headers ) {
-		Some( _ ) => (),
-		None => return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!("Is {}:{} an icecast server?", host, port) ) ) )
-	};
+	if get_header( "icy-name", res.headers ).is_none() {
+		return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Is this a valid icecast stream?" ) ) );
+	}
 
 	// Sources must have a content type
 	let mut properties = match get_header( "Content-Type", res.headers ) {
-		Some( content_type ) => IcyProperties::new( String::from_utf8_lossy( content_type ).to_string() ),
-		None => return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!( "No Content-Type found for relay {}:{}{}", host, port, mount ) ) ) )
+		Some( content_type ) => IcyProperties::new( std::str::from_utf8( content_type )?.to_string() ),
+		None => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "No Content-Type provided" ) ) )
 	};
 
 	// Parse the headers for the source properties
@@ -1312,7 +1296,7 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 	// The source is not needed if the map already has one. TODO Try using try_insert if it's stable in the future
 	if serv.sources.contains_key( &path ) {
 		// The error handling in this program is absolutely awful
-		Err( Box::new( std::io::Error::new( ErrorKind::Other, format!( "A source with the same mountpoint already exists: {}", path ) ) ) )
+		Err( Box::new( std::io::Error::new( ErrorKind::Other, "A source with the same mountpoint already exists" ) ) )
 	} else {
 		if serv.relay_count >= master_server.relay_limit || serv.sources.len() >= serv.properties.limits.total_sources {
 			return Err( Box::new( std::io::Error::new( ErrorKind::Other, "The server relay limit has been reached" ) ) );
@@ -1345,7 +1329,7 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 				match sock.read( &mut buf ).await {
 					Ok( n ) => n,
 					Err( e ) => {
-						println!( "An error occured while reading stream data: {}", e );
+						println!( "An error occured while reading stream data from relay {}: {}", arc.read().await.mountpoint, e );
 						0
 					}
 				}
@@ -1456,7 +1440,11 @@ async fn slave_node( server: Arc< RwLock< Server > >, master_server: MasterServe
 			let server_clone = server.clone();
 			let master_clone = master_server.clone();
 			tokio::spawn( async move {
-				relay_mountpoint( server_clone, master_clone, path ).await.ok();
+				let host = master_clone.host.clone();
+				let port = master_clone.port;
+				if let Err( e ) = relay_mountpoint( server_clone, master_clone, path.clone() ).await {
+					println!( "An error occured while relaying {} from {}:{}: {}", path, host, port, e );
+				}
 			} );
 		}
 		
@@ -1831,7 +1819,8 @@ fn default_property_limits() -> ServerLimits { ServerLimits {
 	burst_size: default_property_limits_burst_size(),
 	header_timeout: default_property_limits_header_timeout(),
 	source_timeout: default_property_limits_source_timeout(),
-	source_limits: default_property_limits_source_limits()
+	source_limits: default_property_limits_source_limits(),
+	http_max_length: default_property_limits_http_max_length()
 } }
 fn default_property_limits_clients() -> usize { CLIENTS }
 fn default_property_limits_sources() -> usize { SOURCES }
@@ -1840,6 +1829,7 @@ fn default_property_limits_queue_size() -> usize { QUEUE_SIZE }
 fn default_property_limits_burst_size() -> usize { BURST_SIZE }
 fn default_property_limits_header_timeout() -> u64 { HEADER_TIMEOUT }
 fn default_property_limits_source_timeout() -> u64 { SOURCE_TIMEOUT }
+fn default_property_limits_http_max_length() -> usize { HTTP_MAX_LENGTH }
 fn default_property_limits_source_mountpoint() -> String { "/radio".to_string() }
 fn default_property_limits_source_limits() -> HashMap< String, SourceLimits > {
 	let mut map = HashMap::new();
@@ -1932,6 +1922,7 @@ async fn main() {
 	println!( "Using BURST SIZE      : {}", properties.limits.burst_size );
 	println!( "Using HEADER TIMEOUT  : {}", properties.limits.header_timeout );
 	println!( "Using SOURCE TIMEOUT  : {}", properties.limits.source_timeout );
+	println!( "Using HTTP MAX LENGTH : {}", properties.limits.http_max_length );
 	if properties.master_server.enabled {
 		println!( "Using a master server:" );
 		println!( "      HOST            : {}", &properties.master_server.host );
