@@ -304,21 +304,33 @@ impl Server {
 }
 
 async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStream ) -> Result< (), Box< dyn Error > > {
-	let mut message = Vec::new();
 	let ( server_id, header_timeout, http_max_len ) = {
 		let properties = &server.read().await.properties;
 		( properties.server_id.clone(), properties.limits.header_timeout, properties.limits.http_max_length )
 	};
 
+	let mut message = Vec::new();
+	let mut buf = [ 0; 1024 ];
+	
 	// Add a timeout
-	timeout( Duration::from_millis( header_timeout ), read_http_message( &mut stream, &mut message, http_max_len ) ).await??;
+	timeout( Duration::from_millis( header_timeout ), async {
+		loop {
+			let mut headers = [ httparse::EMPTY_HEADER; 32 ];
+			let mut req = httparse::Request::new( &mut headers );
+			let read = stream.read( &mut buf ).await?;
+			message.extend_from_slice( &buf[ .. read ] );
+			match req.parse( &message ) {
+				Ok( Status::Complete( offset ) ) => return Ok( offset ),
+				Ok( Status::Partial ) if message.len() > http_max_len => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Request exceeded the maximum allowed length" ) ) ),
+				Ok( Status::Partial ) => (),
+				Err( e ) => return Err( Box::new( std::io::Error::new( ErrorKind::InvalidData, format!( "Received an invalid request: {}", e ) ) ) )
+			}
+		}
+	} ).await??;
 
 	let mut _headers = [ httparse::EMPTY_HEADER; 32 ];
 	let mut req = httparse::Request::new( &mut _headers );
-	if req.parse( &message )? == Status::Partial {
-		return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Received an incomplete request" ) ) );
-	}
-
+	let body_offset = req.parse( &message )?.unwrap();
 	let method = req.method.unwrap();
 
 	let ( base_path, queries ) = extract_queries( req.path.unwrap() );
@@ -459,6 +471,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			drop( serv );
 
 			println!( "Mounted source on {} via {}", arc.read().await.mountpoint, method );
+
+			if message.len() > body_offset {
+				let slice = &message[ body_offset .. ];
+				broadcast_to_clients( &arc, slice.to_vec(), queue_size, burst_size ).await;
+			}
 
 			// Listen for bytes
 			while {
@@ -1161,24 +1178,20 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 	Ok( () )
 }
 
-async fn read_http_message( stream: &mut TcpStream, buf: &mut Vec< u8 >, max_len: usize ) -> Result< (), Box< dyn Error > > {
-	let mut byte = [ 0; 1 ];
-	while buf.windows( 4 ).last() != Some( b"\r\n\r\n" ) {
-		match stream.read( &mut byte ).await {
-			Ok( read ) if read > 0 => {
-				buf.push( byte[ 0 ] );
-				if buf.len() > max_len {
-					// Stop any potential attack
-					return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Master node sent a long header" ) ) )
-				}
-			}
-			// Cannot be anything besides 0 at this point, but the compiler can't tell the difference
-			Ok( _ ) => return Ok( () ),
-			Err( e ) => return Err( Box::new( e ) )
+async fn read_http_response( stream: &mut TcpStream, buffer: &mut Vec< u8 >, max_len: usize ) -> Result< usize, Box< dyn Error > > {
+	let mut buf = [ 0; 1024 ];
+	loop {
+		let mut headers = [ httparse::EMPTY_HEADER; 32 ];
+		let mut res = httparse::Response::new( &mut headers );
+		let read = stream.read( &mut buf ).await?;
+		buffer.extend_from_slice( &buf[ .. read ] );
+		match res.parse( &buffer ) {
+			Ok( Status::Complete( offset ) ) => return Ok( offset ),
+			Ok( Status::Partial ) if buffer.len() > max_len => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Request exceeded the maximum allowed length" ) ) ),
+			Ok( Status::Partial ) => (),
+			Err( e ) => return Err( Box::new( std::io::Error::new( ErrorKind::InvalidData, format!( "Received an invalid request: {}", e ) ) ) )
 		}
 	}
-	
-	Ok( () )
 }
 
 async fn master_server_mountpoints( server: &Arc< RwLock< Server > >, master_info: &MasterServer ) -> Result< Vec<String>, Box< dyn Error > > {
@@ -1187,19 +1200,21 @@ async fn master_server_mountpoints( server: &Arc< RwLock< Server > >, master_inf
 		let properties = &server.read().await.properties;
 		( properties.server_id.clone(), properties.limits.header_timeout, properties.limits.http_max_length )
 	};
+	// TODO Check if TLS is required
 	let mut sock = TcpStream::connect( format!( "{}:{}", master_info.host, master_info.port ) ).await?;
 	sock.write_all( format!( "GET /api/serverinfo HTTP/1.0\r\nUser-Agent: {}\r\nConnection: Closed\r\n\r\n", server_id ).as_bytes() ).await?;
 
 	let mut message = Vec::new();
 	// read headers from client
-	timeout( Duration::from_millis( header_timeout ), read_http_message( &mut sock, &mut message, http_max_len ) ).await??;
+	timeout( Duration::from_millis( header_timeout ), read_http_response( &mut sock, &mut message, http_max_len ) ).await??;
 
 	let mut headers = [ httparse::EMPTY_HEADER; 32 ];
 	let mut res = httparse::Response::new( &mut headers );
 
-	if res.parse( &message )? == Status::Partial {
-		return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Received an incomplete response" ) ) );
-	}
+	let body_offset = match res.parse( &message )? {
+		Status::Complete( offset )=> offset,
+		Status::Partial => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Received an incomplete response" ) ) )
+	};
 
 	let mut len = match get_header( "Content-Length", res.headers ) {
 		Some( val ) => {
@@ -1218,6 +1233,10 @@ async fn master_server_mountpoints( server: &Arc< RwLock< Server > >, master_inf
 	let source_timeout = server.read().await.properties.limits.source_timeout;
 
 	let mut json_slice = Vec::new();
+	if message.len() > body_offset {
+		len -= message.len() - body_offset;
+		json_slice.extend_from_slice( &message[ body_offset .. ] );
+	}
 	let mut buf = [ 0; 512 ];
 	while len != 0 {
 		// Read the incoming stream data until it closes
@@ -1256,14 +1275,15 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 
 	let mut buf = Vec::new();
 	// read headers from server
-	timeout( Duration::from_millis( header_timeout ), read_http_message( &mut sock, &mut buf, http_max_len ) ).await??;
+	timeout( Duration::from_millis( header_timeout ), read_http_response( &mut sock, &mut buf, http_max_len ) ).await??;
 
 	let mut headers = [ httparse::EMPTY_HEADER; 32 ];
 	let mut res = httparse::Response::new( &mut headers );
 	
-	if res.parse( &buf )? == Status::Partial {
-		return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Received an incomplete response" ) ) );
-	}
+	let body_offset = match res.parse( &buf )? {
+		Status::Complete( offset )=> offset,
+		Status::Partial => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Received an incomplete response" ) ) )
+	};
 
 	match res.code {
 		Some( 200 ) => (),
@@ -1320,6 +1340,11 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 		drop( serv );
 
 		println!( "Mounted relay on {}", arc.read().await.mountpoint );
+		
+		if buf.len() > body_offset {
+			let slice = &buf[ body_offset .. ];
+			broadcast_to_clients( &arc, slice.to_vec(), queue_size, burst_size ).await;
+		}
 		
 		// Listen for bytes
 		while {
@@ -1925,9 +1950,10 @@ async fn main() {
 	println!( "Using HTTP MAX LENGTH : {}", properties.limits.http_max_length );
 	if properties.master_server.enabled {
 		println!( "Using a master server:" );
-		println!( "      HOST            : {}", &properties.master_server.host );
-		println!( "      PORT            : {}", &properties.master_server.port );
-		println!( "      UPDATE INTERVAL : {} seconds", &properties.master_server.update_interval );
+		println!( "      HOST            : {}", properties.master_server.host );
+		println!( "      PORT            : {}", properties.master_server.port );
+		println!( "      UPDATE INTERVAL : {} seconds", properties.master_server.update_interval );
+		println!( "      RELAY LIMIT     : {}", properties.master_server.relay_limit );
 	}
 	for ( mount, limit ) in &properties.limits.source_limits {
 		println!( "Using limits for {}:", mount );
