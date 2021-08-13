@@ -16,6 +16,9 @@ use tokio::net::{ TcpListener, TcpStream };
 use tokio::sync::RwLock;
 use tokio::sync::mpsc::{ UnboundedSender, UnboundedReceiver, unbounded_channel };
 use tokio::time::timeout;
+use tokio_native_tls::TlsStream;
+use tokio_native_tls::native_tls::TlsConnector;
+use url::Url;
 use uuid::Uuid;
 
 // Default constants
@@ -180,10 +183,8 @@ struct SourceStats {
 struct MasterServer {
 	#[ serde( default = "default_property_master_server_enabled" ) ]
 	enabled: bool,
-	#[ serde( default = "default_property_master_server_host" ) ]
-	host: String,
-	#[ serde( default = "default_property_master_server_port" ) ]
-	port: u16,
+	#[ serde( default = "default_property_master_server_url" ) ]
+	url: String,
 	#[ serde( default = "default_property_master_server_update_interval" ) ]
 	update_interval: u64,
 	#[ serde( default = "default_property_master_server_relay_limit" ) ]
@@ -299,6 +300,27 @@ impl Server {
 			relay_count: 0,
 			properties,
 			stats: ServerStats::new()
+		}
+	}
+}
+
+enum Stream {
+	Plain( TcpStream ),
+	Tls( Box< TlsStream< TcpStream > > )
+}
+
+impl Stream {
+	async fn read( &mut self, buf: &mut [ u8 ] ) -> std::io::Result< usize > {
+		match self {
+			Stream::Plain( stream ) => stream.read( buf ).await,
+			Stream::Tls( stream ) => stream.read( buf ).await
+		}
+	}
+	
+	async fn write_all( &mut self, buf: &[ u8 ] ) -> std::io::Result< () > {
+		match self {
+			Stream::Plain( stream ) => stream.write_all( buf ).await,
+			Stream::Tls( stream ) => stream.write_all( buf ).await
 		}
 	}
 }
@@ -1178,7 +1200,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 	Ok( () )
 }
 
-async fn read_http_response( stream: &mut TcpStream, buffer: &mut Vec< u8 >, max_len: usize ) -> Result< usize, Box< dyn Error > > {
+async fn read_http_response( stream: &mut Stream, buffer: &mut Vec< u8 >, max_len: usize ) -> Result< usize, Box< dyn Error > > {
 	let mut buf = [ 0; 1024 ];
 	loop {
 		let mut headers = [ httparse::EMPTY_HEADER; 32 ];
@@ -1194,25 +1216,116 @@ async fn read_http_response( stream: &mut TcpStream, buffer: &mut Vec< u8 >, max
 	}
 }
 
+async fn connect_and_redirect( url: String, headers: Vec< String >, max_len: usize, max_redirects: usize ) -> Result< ( Stream, Vec< u8 > ), Box< dyn Error > > {
+	let mut str_url = url;
+	let mut remaining_redirects = max_redirects;
+	loop {
+		let mut url = Url::parse( str_url.as_str() )?;
+		if let Some( host ) = url.host_str() {
+			let addr = {
+				if let Some( port ) = url.port_or_known_default() {
+					format!( "{}:{}", host, port )
+				} else {
+					host.to_string()
+				}
+			};
+			
+			let mut stream = match url.scheme() {
+				"https" => {
+					// Use tls
+					let stream = TcpStream::connect( addr.clone() ).await?;
+					let cx = tokio_native_tls::TlsConnector::from( TlsConnector::builder().build()? );
+					Stream::Tls( Box::new( cx.connect( host, stream ).await? ) )
+				}
+				_ => {
+					Stream::Plain( TcpStream::connect( addr.clone() ).await? )
+				}
+			};
+			
+			// Build the path
+			let mut path = url.path().to_string();
+			if let Some( query ) = url.query() {
+				path = format!( "{}?{}", path, query );
+			}
+			if let Some( fragment ) = url.fragment() {
+				path = format!( "{}#{}", path, fragment );
+			}
+			
+			// Write the message
+			let mut req_buf = Vec::new();
+			req_buf.extend_from_slice( format!( "GET {} HTTP/1.1\r\n", path ).as_bytes() );
+			for header in &headers {
+				req_buf.extend_from_slice( header.as_bytes() );
+				req_buf.extend_from_slice( b"\r\n" );
+			}
+			req_buf.extend_from_slice( format!( "Host: {}\r\n\r\n", addr ).as_bytes() );
+			stream.write_all( &req_buf ).await?;
+			
+			let mut buf = Vec::new();
+			// First time parsing the response
+			read_http_response( &mut stream, &mut buf, max_len ).await?;
+			
+			let mut _headers = [ httparse::EMPTY_HEADER; 32 ];
+			let mut res = httparse::Response::new( &mut _headers );
+			
+			// Second time parsing the response
+			if res.parse( &buf )? == Status::Partial {
+				return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Received an incomplete response" ) ) );
+			}
+			
+			match res.code {
+				Some( code ) => {
+					if code / 100 == 3 || code == 201 {
+						if remaining_redirects == 0 {
+							// Reached maximum number of redirects!
+							return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Maximum redirects reached" ) ) );
+						} else if let Some( location ) = get_header( "Location", res.headers ) {
+							// Try parsing it into a URL first
+							let loc_str = std::str::from_utf8( location )?;
+							if let Ok( mut redirect ) = Url::parse( loc_str ) {
+								redirect.set_query( url.query() );
+								str_url = redirect.as_str().to_string();
+							} else {
+								if location[ 0 ] == b'/' {
+									url.set_path( loc_str );
+								} else {
+									url.join( loc_str )?;
+								}
+								str_url = url.as_str().to_string();
+							}
+							
+							remaining_redirects -= 1;
+						} else {
+							return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Invalid Location" ) ) );
+						}
+					} else {
+						return Ok( ( stream, buf ) );
+					}
+				}
+				None => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Missing response code" ) ) )
+			}
+		} else {
+			return Err( Box::new( std::io::Error::new( ErrorKind::AddrNotAvailable, format!( "Invalid URL provided: {}", str_url ) ) ) );
+		}
+	}
+}
+
 async fn master_server_mountpoints( server: &Arc< RwLock< Server > >, master_info: &MasterServer ) -> Result< Vec<String>, Box< dyn Error > > {
 	// Get all master mountpoints
 	let ( server_id, header_timeout, http_max_len ) = {
 		let properties = &server.read().await.properties;
 		( properties.server_id.clone(), properties.limits.header_timeout, properties.limits.http_max_length )
 	};
-	// TODO Check if TLS is required
-	let mut sock = TcpStream::connect( format!( "{}:{}", master_info.host, master_info.port ) ).await?;
-	sock.write_all( format!( "GET /api/serverinfo HTTP/1.0\r\nUser-Agent: {}\r\nConnection: Closed\r\n\r\n", server_id ).as_bytes() ).await?;
-
-	let mut message = Vec::new();
+	
 	// read headers from client
-	timeout( Duration::from_millis( header_timeout ), read_http_response( &mut sock, &mut message, http_max_len ) ).await??;
+	let headers = vec![ format!( "User-Agent: {}", server_id ), "Connection: Closed".to_string() ];
+	let ( mut sock, message ) = timeout( Duration::from_millis( header_timeout ), connect_and_redirect( format!( "{}/api/serverinfo", master_info.url ), headers, http_max_len, 5 ) ).await??;
 
 	let mut headers = [ httparse::EMPTY_HEADER; 32 ];
 	let mut res = httparse::Response::new( &mut headers );
 
 	let body_offset = match res.parse( &message )? {
-		Status::Complete( offset )=> offset,
+		Status::Complete( offset ) => offset,
 		Status::Partial => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Received an incomplete response" ) ) )
 	};
 
@@ -1226,7 +1339,7 @@ async fn master_server_mountpoints( server: &Arc< RwLock< Server > >, master_inf
 
 	match res.code {
 		Some( 200 ) => (),
-		Some( code ) => return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!( "Invalid response: {}", code ) ) ) ),
+		Some( code ) => return Err( Box::new( std::io::Error::new( ErrorKind::Other, format!( "Invalid response: {} {}", code, res.reason.unwrap() ) ) ) ),
 		None => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Missing response code" ) ) )
 	}
 
@@ -1267,15 +1380,10 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 		let properties = &server.read().await.properties;
 		( properties.server_id.clone(), properties.limits.header_timeout, properties.limits.http_max_length )
 	};
-	let host = master_server.host;
-	let port = master_server.port;
-	
-	let mut sock = TcpStream::connect( format!("{}:{}", host, port ) ).await?;
-	sock.write_all( format!( "GET /{} HTTP/1.0\r\nUser-Agent: {}\r\nConnection: Closed\r\n\r\n", mount, server_id ).as_bytes( )).await?;
 
-	let mut buf = Vec::new();
 	// read headers from server
-	timeout( Duration::from_millis( header_timeout ), read_http_response( &mut sock, &mut buf, http_max_len ) ).await??;
+	let headers = vec![ format!( "User-Agent: {}", server_id ), "Connection: Closed".to_string() ];
+	let ( mut sock, buf ) = timeout( Duration::from_millis( header_timeout ), connect_and_redirect( format!( "{}{}", master_server.url, mount ), headers, http_max_len, 5 ) ).await??;
 
 	let mut headers = [ httparse::EMPTY_HEADER; 32 ];
 	let mut res = httparse::Response::new( &mut headers );
@@ -1431,7 +1539,7 @@ async fn slave_node( server: Arc< RwLock< Server > >, master_server: MasterServe
 		let mut mounts = Vec::new();
 		match master_server_mountpoints( &server, &master_server ).await {
 			Ok( v ) => mounts.extend( v ),
-			Err( e ) => println!( "Error while fetching mountpoints from {}:{}: {}", master_server.host, master_server.port, e )
+			Err( e ) => println!( "Error while fetching mountpoints from {}: {}", master_server.url, e )
 		}
 		
 		for mount in mounts {
@@ -1465,10 +1573,9 @@ async fn slave_node( server: Arc< RwLock< Server > >, master_server: MasterServe
 			let server_clone = server.clone();
 			let master_clone = master_server.clone();
 			tokio::spawn( async move {
-				let host = master_clone.host.clone();
-				let port = master_clone.port;
+				let url = master_clone.url.clone();
 				if let Err( e ) = relay_mountpoint( server_clone, master_clone, path.clone() ).await {
-					println!( "An error occured while relaying {} from {}:{}: {}", path, host, port, e );
+					println!( "An error occured while relaying {} from {}: {}", path, url, e );
 				}
 			} );
 		}
@@ -1867,14 +1974,12 @@ fn default_property_limits_source_limits() -> HashMap< String, SourceLimits > {
 }
 fn default_property_master_server() -> MasterServer { MasterServer {
 	enabled: default_property_master_server_enabled(),
-	host: default_property_master_server_host(),
-	port: default_property_master_server_port(),
+	url: default_property_master_server_url(),
 	update_interval: default_property_master_server_update_interval(),
 	relay_limit: default_property_master_server_relay_limit()
 } }
 fn default_property_master_server_enabled() -> bool { false }
-fn default_property_master_server_host() -> String { "localhost".to_string() }
-fn default_property_master_server_port() -> u16 { default_property_port() + 1 }
+fn default_property_master_server_url() -> String { format!( "http://localhost:{}", default_property_port() + 1 ) }
 fn default_property_master_server_update_interval() -> u64 { 120 }
 fn default_property_master_server_relay_limit() -> usize { SOURCES }
 
@@ -1950,8 +2055,7 @@ async fn main() {
 	println!( "Using HTTP MAX LENGTH : {}", properties.limits.http_max_length );
 	if properties.master_server.enabled {
 		println!( "Using a master server:" );
-		println!( "      HOST            : {}", properties.master_server.host );
-		println!( "      PORT            : {}", properties.master_server.port );
+		println!( "      URL             : {}", properties.master_server.url );
 		println!( "      UPDATE INTERVAL : {} seconds", properties.master_server.update_interval );
 		println!( "      RELAY LIMIT     : {}", properties.master_server.relay_limit );
 	}
