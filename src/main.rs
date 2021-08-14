@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
 use std::io::{ BufWriter, ErrorKind, Write };
-use std::net::{ SocketAddr, IpAddr, Ipv4Addr };
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{ Duration, SystemTime, UNIX_EPOCH };
@@ -22,6 +22,7 @@ use url::Url;
 use uuid::Uuid;
 
 // Default constants
+const ADDRESS: &str = "0.0.0.0";
 const PORT: u16 = 8000;
 // The default interval in bytes between icy metadata chunks
 // The metaint cannot be changed per client once the response has been sent
@@ -55,6 +56,8 @@ const HEADER_TIMEOUT: u64 = 15_000;
 const SOURCE_TIMEOUT: u64 = 10_000;
 // The maximum size in bytes of an acceptable http message not including the body
 const HTTP_MAX_LENGTH: usize = 8192;
+// The maximum number of redirects allowed, when fetching relays from another server/stream
+const HTTP_MAX_REDIRECTS: usize = 5;
 
 #[ derive( Clone ) ]
 struct Query {
@@ -217,12 +220,16 @@ struct ServerLimits {
 	source_timeout: u64,
 	#[ serde( default = "default_property_limits_http_max_length" ) ]
 	http_max_length: usize,
+	#[ serde( default = "default_property_limits_http_max_redirects" ) ]
+	http_max_redirects: usize,
 	#[ serde( default = "default_property_limits_source_limits" ) ]
 	source_limits: HashMap< String, SourceLimits >
 }
 
 #[ derive( Serialize, Deserialize, Clone ) ]
 struct ServerProperties {
+	#[ serde( default = "default_property_address" ) ]
+	address: String,
 	#[ serde( default = "default_property_port" ) ]
 	port: u16,
 	#[ serde( default = "default_property_metaint" ) ]
@@ -248,6 +255,7 @@ struct ServerProperties {
 impl ServerProperties {
 	fn new() -> ServerProperties {
 		ServerProperties {
+			address: default_property_address(),
 			port: default_property_port(),
 			metaint: default_property_metaint(),
 			server_id: default_property_server_id(),
@@ -366,13 +374,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			if let Some( ( name, pass ) ) = get_basic_auth( headers ) {
 				if !validate_user( &server.read().await.properties, name, pass ) {
 					// Invalid user/pass provided
-					send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=urf-8", "Invalid credentials" ) ) ).await?;
-					return Ok( () )
+					return send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=urf-8", "Invalid credentials" ) ) ).await;
 				}
 			} else {
 				// No auth, return and close
-				send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=urf-8", "You need to authenticate" ) ) ).await?;
-				return Ok( () )
+				return send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=urf-8", "You need to authenticate" ) ) ).await;
 			}
 
 			// http://example.com/radio == http://example.com/radio/
@@ -394,8 +400,7 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 					path.starts_with( "/admin/" ) ||
 					path == "/api" ||
 					path.starts_with( "/api/" ) {
-				send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
-				return Ok( () )
+				return send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await;
 			}
 
 			// Check if it is valid
@@ -404,16 +409,13 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			if let Some( parent ) = dir.parent() {
 				if let Some( parent_str ) = parent.to_str() {
 					if parent_str != "/" {
-						send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
-						return Ok( () )
+						return send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await;
 					}
 				} else {
-					send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
-					return Ok( () )
+					return send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await;
 				}
 			} else {
-				send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
-				return Ok( () )
+				return send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await;
 			}
 
 			// Sources must have a content type
@@ -421,22 +423,19 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 			let mut properties = match get_header( "Content-Type", headers ) {
 				Some( content_type ) => IcyProperties::new( std::str::from_utf8( content_type )?.to_string() ),
 				None => {
-					send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "No Content-type provided" ) ) ).await?;
-					return Ok( () )
+					return send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "No Content-type provided" ) ) ).await;
 				}
 			};
 
 			let mut serv = server.write().await;
 			// Check if the mountpoint is already in use
 			if serv.sources.contains_key( &path ) {
-				send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await?;
-				return Ok( () )
+				return send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid mountpoint" ) ) ).await;
 			}
 
 			// Check if the max number of sources has been reached
 			if serv.source_count >= serv.properties.limits.sources || serv.sources.len() >= serv.properties.limits.total_sources {
-				send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Too many sources connected" ) ) ).await?;
-				return Ok( () )
+				return send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Too many sources connected" ) ) ).await;
 			}
 
 			if method == "SOURCE" {
@@ -448,27 +447,16 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				// TODO Add support for transfer encoding options as specified here: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Transfer-Encoding
 				// TODO Also potentially add support for content length? Not sure if that's a particularly large priority
 				match get_header( "Transfer-Encoding", headers ) {
-					Some( v ) if v != b"identity" => {
-						send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Unsupported transfer encoding" ) ) ).await?;
-						return Ok( () )
-					}
+					Some( v ) if v != b"identity" => return send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Unsupported transfer encoding" ) ) ).await,
 					_ => ()
 				}
 
 				// Check if client sent Expect: 100-continue in header, if that's the case we will need to return 100 in status code
 				// Without it, it means that client has no body to send, we will stop if that's the case
 				match get_header( "Expect", headers ) {
-					Some( b"100-continue" ) => {
-						send_continue( &mut stream, &server_id ).await?;
-					}
-					Some( _ ) => {
-						send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Expected 100-continue in Expect header" ) ) ).await?;
-						return Ok( () )
-					}
-					None => {
-						send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "PUT request must come with Expect header" ) ) ).await?;
-						return Ok( () )
-					}
+					Some( b"100-continue" ) => send_continue( &mut stream, &server_id ).await?,
+					Some( _ ) => return send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Expected 100-continue in Expect header" ) ) ).await,
+					None => return send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "PUT request must come with Expect header" ) ) ).await
 				}
 			}
 			
@@ -795,13 +783,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
-								send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
-								return Ok( () )
+								return send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await;
 							}
 						} else {
 							// No auth, return and close
-							send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
-							return Ok( () )
+							return send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await;
 						}
 
 						// Authentication passed
@@ -841,13 +827,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
-								send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
-								return Ok( () )
+								return send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await;
 							}
 						} else {
 							// No auth, return and close
-							send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
-							return Ok( () )
+							return send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await;
 						}
 
 						if let Some( queries ) = queries {
@@ -892,13 +876,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
-								send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
-								return Ok( () )
+								return send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await;
 							}
 						} else {
 							// No auth, return and close
-							send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
-							return Ok( () )
+							return send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await;
 						}
 
 						if let Some( queries ) = queries {
@@ -931,13 +913,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
-								send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
-								return Ok( () )
+								return send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await;
 							}
 						} else {
 							// No auth, return and close
-							send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
-							return Ok( () )
+							return send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await;
 						}
 
 						if let Some( queries ) = queries {
@@ -973,13 +953,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
-								send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
-								return Ok( () )
+								return send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await;
 							}
 						} else {
 							// No auth, return and close
-							send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
-							return Ok( () )
+							return send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await;
 						}
 
 						if let Some( queries ) = queries {
@@ -1013,13 +991,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
-								send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
-								return Ok( () )
+								return send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await;
 							}
 						} else {
 							// No auth, return and close
-							send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
-							return Ok( () )
+							return send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await;
 						}
 
 						if let Some( queries ) = queries {
@@ -1048,13 +1024,11 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 							// For testing purposes right now
 							// TODO Add proper configuration
 							if !validate_user( &serv.properties, name, pass ) {
-								send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await?;
-								return Ok( () )
+								return send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid credentials" ) ) ).await;
 							}
 						} else {
 							// No auth, return and close
-							send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await?;
-							return Ok( () )
+							return send_unauthorized( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "You need to authenticate" ) ) ).await;
 						}
 
 						let mut sources: HashMap< String, Value > = HashMap::new();
@@ -1312,14 +1286,14 @@ async fn connect_and_redirect( url: String, headers: Vec< String >, max_len: usi
 
 async fn master_server_mountpoints( server: &Arc< RwLock< Server > >, master_info: &MasterServer ) -> Result< Vec<String>, Box< dyn Error > > {
 	// Get all master mountpoints
-	let ( server_id, header_timeout, http_max_len ) = {
+	let ( server_id, header_timeout, http_max_len, http_max_redirects ) = {
 		let properties = &server.read().await.properties;
-		( properties.server_id.clone(), properties.limits.header_timeout, properties.limits.http_max_length )
+		( properties.server_id.clone(), properties.limits.header_timeout, properties.limits.http_max_length, properties.limits.http_max_redirects )
 	};
 	
 	// read headers from client
 	let headers = vec![ format!( "User-Agent: {}", server_id ), "Connection: Closed".to_string() ];
-	let ( mut sock, message ) = timeout( Duration::from_millis( header_timeout ), connect_and_redirect( format!( "{}/api/serverinfo", master_info.url ), headers, http_max_len, 5 ) ).await??;
+	let ( mut sock, message ) = timeout( Duration::from_millis( header_timeout ), connect_and_redirect( format!( "{}/api/serverinfo", master_info.url ), headers, http_max_len, http_max_redirects ) ).await??;
 
 	let mut headers = [ httparse::EMPTY_HEADER; 32 ];
 	let mut res = httparse::Response::new( &mut headers );
@@ -1376,14 +1350,14 @@ async fn master_server_mountpoints( server: &Arc< RwLock< Server > >, master_inf
 
 #[ allow( clippy::map_entry ) ]
 async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: MasterServer, mount: String ) -> Result< (), Box< dyn Error > > {
-	let ( server_id, header_timeout, http_max_len ) = {
+	let ( server_id, header_timeout, http_max_len, http_max_redirects ) = {
 		let properties = &server.read().await.properties;
-		( properties.server_id.clone(), properties.limits.header_timeout, properties.limits.http_max_length )
+		( properties.server_id.clone(), properties.limits.header_timeout, properties.limits.http_max_length, properties.limits.http_max_redirects )
 	};
 
 	// read headers from server
 	let headers = vec![ format!( "User-Agent: {}", server_id ), "Connection: Closed".to_string() ];
-	let ( mut sock, buf ) = timeout( Duration::from_millis( header_timeout ), connect_and_redirect( format!( "{}{}", master_server.url, mount ), headers, http_max_len, 5 ) ).await??;
+	let ( mut sock, buf ) = timeout( Duration::from_millis( header_timeout ), connect_and_redirect( format!( "{}{}", master_server.url, mount ), headers, http_max_len, http_max_redirects ) ).await??;
 
 	let mut headers = [ httparse::EMPTY_HEADER; 32 ];
 	let mut res = httparse::Response::new( &mut headers );
@@ -1426,7 +1400,7 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 		// The error handling in this program is absolutely awful
 		Err( Box::new( std::io::Error::new( ErrorKind::Other, "A source with the same mountpoint already exists" ) ) )
 	} else {
-		if serv.relay_count >= master_server.relay_limit || serv.sources.len() >= serv.properties.limits.total_sources {
+		if serv.relay_count >= master_server.relay_limit {
 			return Err( Box::new( std::io::Error::new( ErrorKind::Other, "The server relay limit has been reached" ) ) );
 		} else if serv.sources.len() >= serv.properties.limits.total_sources {
 			return Err( Box::new( std::io::Error::new( ErrorKind::Other, "The server total source limit has been reached" ) ) );
@@ -1564,9 +1538,14 @@ async fn slave_node( server: Arc< RwLock< Server > >, master_server: MasterServe
 				continue;
 			}
 			
-			if server.read().await.sources.contains_key( &path ) {
-				// mount already exists
-				continue;
+			{
+				let serv = server.read().await;
+				// Check relay limit and if the source already exists
+				if serv.relay_count >= master_server.relay_limit ||
+					serv.sources.len() >= serv.properties.limits.total_sources ||
+					server.read().await.sources.contains_key( &path ) {
+					continue;
+				}
 			}
 			
 			// trying to mount all mounts from master
@@ -1935,6 +1914,7 @@ fn validate_user( properties: &ServerProperties, username: String, password: Str
 }
 
 // Serde default deserialization values
+fn default_property_address() -> String { ADDRESS.to_string() }
 fn default_property_port() -> u16 { PORT }
 fn default_property_metaint() -> usize { METAINT }
 fn default_property_server_id() -> String { SERVER_ID.to_string() }
@@ -1952,7 +1932,8 @@ fn default_property_limits() -> ServerLimits { ServerLimits {
 	header_timeout: default_property_limits_header_timeout(),
 	source_timeout: default_property_limits_source_timeout(),
 	source_limits: default_property_limits_source_limits(),
-	http_max_length: default_property_limits_http_max_length()
+	http_max_length: default_property_limits_http_max_length(),
+	http_max_redirects: default_property_limits_http_max_redirects()
 } }
 fn default_property_limits_clients() -> usize { CLIENTS }
 fn default_property_limits_sources() -> usize { SOURCES }
@@ -1962,6 +1943,7 @@ fn default_property_limits_burst_size() -> usize { BURST_SIZE }
 fn default_property_limits_header_timeout() -> u64 { HEADER_TIMEOUT }
 fn default_property_limits_source_timeout() -> u64 { SOURCE_TIMEOUT }
 fn default_property_limits_http_max_length() -> usize { HTTP_MAX_LENGTH }
+fn default_property_limits_http_max_redirects() -> usize { HTTP_MAX_REDIRECTS }
 fn default_property_limits_source_mountpoint() -> String { "/radio".to_string() }
 fn default_property_limits_source_limits() -> HashMap< String, SourceLimits > {
 	let mut map = HashMap::new();
@@ -2039,75 +2021,82 @@ async fn main() {
 		Err( e ) => println!( "An error occured while to create the config file: {}", e ),
 	}
 
-	println!( "Using PORT            : {}", properties.port );
-	println!( "Using METAINT         : {}", properties.metaint );
-	println!( "Using SERVER ID       : {}", properties.server_id );
-	println!( "Using ADMIN           : {}", properties.admin );
-	println!( "Using HOST            : {}", properties.host );
-	println!( "Using LOCATION        : {}", properties.location );
-	println!( "Using DESCRIPTION     : {}", properties.description );
-	println!( "Using CLIENT LIMIT    : {}", properties.limits.clients );
-	println!( "Using SOURCE LIMIT    : {}", properties.limits.sources );
-	println!( "Using QUEUE SIZE      : {}", properties.limits.queue_size );
-	println!( "Using BURST SIZE      : {}", properties.limits.burst_size );
-	println!( "Using HEADER TIMEOUT  : {}", properties.limits.header_timeout );
-	println!( "Using SOURCE TIMEOUT  : {}", properties.limits.source_timeout );
-	println!( "Using HTTP MAX LENGTH : {}", properties.limits.http_max_length );
+	println!( "Using ADDRESS            : {}", properties.address );
+	println!( "Using PORT               : {}", properties.port );
+	println!( "Using METAINT            : {}", properties.metaint );
+	println!( "Using SERVER ID          : {}", properties.server_id );
+	println!( "Using ADMIN              : {}", properties.admin );
+	println!( "Using HOST               : {}", properties.host );
+	println!( "Using LOCATION           : {}", properties.location );
+	println!( "Using DESCRIPTION        : {}", properties.description );
+	println!( "Using CLIENT LIMIT       : {}", properties.limits.clients );
+	println!( "Using SOURCE LIMIT       : {}", properties.limits.sources );
+	println!( "Using QUEUE SIZE         : {}", properties.limits.queue_size );
+	println!( "Using BURST SIZE         : {}", properties.limits.burst_size );
+	println!( "Using HEADER TIMEOUT     : {}", properties.limits.header_timeout );
+	println!( "Using SOURCE TIMEOUT     : {}", properties.limits.source_timeout );
+	println!( "Using HTTP MAX LENGTH    : {}", properties.limits.http_max_length );
+	println!( "Using HTTP MAX REDIRECTS : {}", properties.limits.http_max_length );
 	if properties.master_server.enabled {
 		println!( "Using a master server:" );
-		println!( "      URL             : {}", properties.master_server.url );
-		println!( "      UPDATE INTERVAL : {} seconds", properties.master_server.update_interval );
-		println!( "      RELAY LIMIT     : {}", properties.master_server.relay_limit );
+		println!( "      URL                : {}", properties.master_server.url );
+		println!( "      UPDATE INTERVAL    : {} seconds", properties.master_server.update_interval );
+		println!( "      RELAY LIMIT        : {}", properties.master_server.relay_limit );
 	}
 	for ( mount, limit ) in &properties.limits.source_limits {
 		println!( "Using limits for {}:", mount );
-		println!( "      CLIENT LIMIT    : {}", limit.clients );
-		println!( "      SOURCE TIMEOUT  : {}", limit.source_timeout );
-		println!( "      BURST SIZE      : {}", limit.burst_size );
+		println!( "      CLIENT LIMIT       : {}", limit.clients );
+		println!( "      SOURCE TIMEOUT     : {}", limit.source_timeout );
+		println!( "      BURST SIZE         : {}", limit.burst_size );
 	}
 
 	if properties.users.is_empty() {
 		println!( "At least one user must be configured in the config!" );
 	} else {
 		println!( "{} users registered", properties.users.len() );
-		println!( "Attempting to bind to port {}", properties.port );
-		match TcpListener::bind( SocketAddr::new( IpAddr::V4( Ipv4Addr::new( 127, 0, 0, 1 ) ), properties.port ) ).await {
-			Ok( listener ) => {
-				let server = Arc::new( RwLock::new( Server::new( properties ) ) );
-
-				if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
-					println!( "The server has started on {}", fmt_http_date( SystemTime::now() ) );
-					server.write().await.stats.start_time = time.as_secs();
-				} else {
-					println!( "Unable to capture when the server started!" );
-				}
-
-				let master_server = server.read().await.properties.master_server.clone();
-				if master_server.enabled {
-					// Start our slave node
-					let server_clone = server.clone();
-					tokio::spawn( async move {
-						slave_node( server_clone, master_server ).await;
-					} );
-				}
-
-				println!( "Listening..." );
-				loop {
-					match listener.accept().await {
-						Ok( ( socket, addr ) ) => {
+		match format!( "{}:{}", properties.address, properties.port ).parse::< SocketAddr >() {
+			Ok( address ) => {
+				println!( "Attempting to bind to {}:{}", properties.address, properties.port );
+				match TcpListener::bind( address ).await {
+					Ok( listener ) => {
+						let server = Arc::new( RwLock::new( Server::new( properties ) ) );
+		
+						if let Ok( time ) = SystemTime::now().duration_since( UNIX_EPOCH ) {
+							println!( "The server has started on {}", fmt_http_date( SystemTime::now() ) );
+							server.write().await.stats.start_time = time.as_secs();
+						} else {
+							println!( "Unable to capture when the server started!" );
+						}
+		
+						let master_server = server.read().await.properties.master_server.clone();
+						if master_server.enabled {
+							// Start our slave node
 							let server_clone = server.clone();
-
 							tokio::spawn( async move {
-								if let Err( e ) = handle_connection( server_clone, socket ).await {
-									println!( "An error occured while handling a connection from {}: {}", addr, e );
-								}
+								slave_node( server_clone, master_server ).await;
 							} );
 						}
-						Err( e ) => println!( "An error occured while accepting a connection: {}", e ),
+		
+						println!( "Listening..." );
+						loop {
+							match listener.accept().await {
+								Ok( ( socket, addr ) ) => {
+									let server_clone = server.clone();
+		
+									tokio::spawn( async move {
+										if let Err( e ) = handle_connection( server_clone, socket ).await {
+											println!( "An error occured while handling a connection from {}: {}", addr, e );
+										}
+									} );
+								}
+								Err( e ) => println!( "An error occured while accepting a connection: {}", e )
+							}
+						}
 					}
+					Err( e ) => println!( "Unable to bind to port: {}", e )
 				}
 			}
-			Err( e ) => println!( "Unable to bind to port: {}", e ),
+			Err( e ) => println!( "Could not parse the address: {}", e )
 		}
 	}
 }
