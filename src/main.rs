@@ -181,7 +181,8 @@ struct SourceStats {
 
 // TODO Add a list of "relay" structs
 // Relay structs should have an auth of their own, if provided
-// TODO Add basic authorization
+// Having a master server is not very good
+// It would be much better to add relays through an api or something
 #[ derive( Serialize, Deserialize, Clone ) ]
 struct MasterServer {
 	#[ serde( default = "default_property_master_server_enabled" ) ]
@@ -228,6 +229,7 @@ struct ServerLimits {
 
 #[ derive( Serialize, Deserialize, Clone ) ]
 struct ServerProperties {
+	// Ideally, there would be multiple addresses and ports and TLS support
 	#[ serde( default = "default_property_address" ) ]
 	address: String,
 	#[ serde( default = "default_property_port" ) ]
@@ -1228,11 +1230,20 @@ async fn connect_and_redirect( url: String, headers: Vec< String >, max_len: usi
 			// Write the message
 			let mut req_buf = Vec::new();
 			req_buf.extend_from_slice( format!( "GET {} HTTP/1.1\r\n", path ).as_bytes() );
+			let mut auth_included = false;
 			for header in &headers {
 				req_buf.extend_from_slice( header.as_bytes() );
 				req_buf.extend_from_slice( b"\r\n" );
+				auth_included |= header.to_lowercase().starts_with( "authorization:" );
 			}
-			req_buf.extend_from_slice( format!( "Host: {}\r\n\r\n", addr ).as_bytes() );
+			req_buf.extend_from_slice( format!( "Host: {}\r\n", addr ).as_bytes() );
+			if !auth_included {
+				if let Some( passwd ) = url.password() {
+					let encoded = base64::encode( format!( "{}:{}", url.username(), passwd ) );
+					req_buf.extend_from_slice( format!( "Authorization: Basic {}\r\n", encoded ) );
+				}
+			}
+			req_buf.extend_from_slice( b"\r\n" );
 			stream.write_all( &req_buf ).await?;
 			
 			let mut buf = Vec::new();
