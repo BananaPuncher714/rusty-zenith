@@ -1514,7 +1514,7 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 	};
 
 	// read headers from server
-	let headers = vec![ format!( "User-Agent: {}", server_id ), "Connection: Closed".to_string(), "IcyMetadata:1".to_string() ];
+	let headers = vec![ format!( "User-Agent: {}", server_id ), "Connection: Closed".to_string(), "Icy-Metadata:1".to_string() ];
 	let ( mut sock, buf ) = timeout( Duration::from_millis( header_timeout ), connect_and_redirect( format!( "{}{}", master_server.url, mount ), headers, http_max_len, http_max_redirects ) ).await??;
 
 	let mut headers = [ httparse::EMPTY_HEADER; 32 ];
@@ -1560,24 +1560,6 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 		None => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "No Content-Type provided" ) ) )
 	};
 
-	struct MetaParser {
-		metaint: usize,
-		meta_vec: Vec< u8 >,
-		meta_current: usize,
-		meta_remaining: usize
-	}
-	
-	let metaint = match get_header( "Icy-Metaint", res.headers ) {
-		Some( val ) => std::str::from_utf8( val )?.parse::< usize >()?,
-		None => 0
-	};
-	let meta_info = MetaParser {
-		metaint,
-		meta_vec: Vec::new(),
-		meta_current: 0,
-		meta_remaining: metaint
-	};
-
 	// Parse the headers for the source properties
 	populate_properties( &mut properties, res.headers );
 	properties.uagent = Some( server_id );
@@ -1615,21 +1597,83 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 		serv.relay_count += 1;
 		drop( serv );
 
+		struct MetaParser {
+			metaint: usize,
+			vec: Vec< u8 >,
+			remaining: usize
+		}
+		
+		let metaint = match get_header( "Icy-Metaint", res.headers ) {
+			Some( val ) => std::str::from_utf8( val )?.parse::< usize >()?,
+			None => 0
+		};
+		let mut meta_info = MetaParser {
+			metaint,
+			vec: Vec::new(),
+			remaining: metaint
+		};
+
 		println!( "Mounted relay on {}", arc.read().await.mountpoint );
 		
 		if buf.len() > body_offset {
 			let slice = &buf[ body_offset .. ];
 			let mut data = Vec::new();
+			// This bit of code is really ugly, but oh well
 			match decoder.decode( &mut data, slice, buf.len() - body_offset ) {
 				Ok( read ) => {
 					if read != 0 {
-						// Parse the data for metadata if possible
-						// Requires metaint
-						// Keeping track of current pos
-						// Fetching the vec
-						// Parse the data with regex
-						broadcast_to_clients( &arc, data, queue_size, burst_size ).await;
-						arc.read().await.stats.write().await.bytes_read += read;
+						// Process any metadata, if it exists
+						let data = {
+							if meta_info.metaint != 0 {
+								let mut trimmed = Vec::new();
+								let mut position = 0;
+								let mut last_full: Option< Vec< u8 > > = None;
+								while position < read {
+									// Either reading in regular stream data
+									// Reading in the length of the metadata
+									// Or reading the metadata directly
+									if meta_info.remaining != 0 {
+										let frame_length = std::cmp::min( read - position, meta_info.remaining );
+										if frame_length != 0 {
+											trimmed.extend_from_slice( &data[ position .. position + frame_length ] );
+											meta_info.remaining -= frame_length;
+											position += frame_length;
+										}
+									} else if meta_info.vec.is_empty() {
+										// Reading the length of the metadata segment
+										meta_info.vec.push( data[ position ] );
+										position += 1;
+									} else {
+										// Reading in metadata
+										let size = 1 + ( meta_info.vec[ 0 ] << 4 ) as usize;
+										let remaining_metadata = std::cmp::min( read - position, size - meta_info.vec.len() );
+										meta_info.vec.extend_from_slice( &data[ position .. position + remaining_metadata ] );
+										position += remaining_metadata;
+										
+										// If it's reached the max size, then copy it over to last_full
+										if meta_info.vec.len() == size {
+											meta_info.remaining = meta_info.metaint;
+											last_full = Some( meta_info.vec.clone() );
+											meta_info.vec.clear();
+										}
+									}
+								}
+								
+								// Update the source's metadata
+								if let Some( metadata_vec ) = last_full {
+									arc.write().await.metadata_vec = metadata_vec;
+								}
+								
+								trimmed
+							} else {
+								data
+							}
+						};
+						
+						if !data.is_empty() {
+							arc.read().await.stats.write().await.bytes_read += data.len();
+							broadcast_to_clients( &arc, data, queue_size, burst_size ).await;
+						}
 					}
 				}
 				Err( e ) => {
@@ -1660,8 +1704,58 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 				match decoder.decode( &mut data, &buf, read ) {
 					Ok( decode_read ) => {
 						if decode_read != 0 {
-							broadcast_to_clients( &arc, data, queue_size, burst_size ).await;
-							arc.read().await.stats.write().await.bytes_read += decode_read;
+							// Process any metadata, if it exists
+							let data = {
+								if meta_info.metaint != 0 {
+									let mut trimmed = Vec::new();
+									let mut position = 0;
+									let mut last_full: Option< Vec< u8 > > = None;
+									while position < decode_read {
+										// Either reading in regular stream data
+										// Reading in the length of the metadata
+										// Or reading the metadata directly
+										if meta_info.remaining != 0 {
+											let frame_length = std::cmp::min( decode_read - position, meta_info.remaining );
+											if frame_length != 0 {
+												trimmed.extend_from_slice( &data[ position .. position + frame_length ] );
+												meta_info.remaining -= frame_length;
+												position += frame_length;
+											}
+										} else if meta_info.vec.is_empty() {
+											// Reading the length of the metadata segment
+											meta_info.vec.push( data[ position ] );
+											position += 1;
+										} else {
+											// Reading in metadata
+											let size = 1 + ( meta_info.vec[ 0 ] << 4 ) as usize;
+											let remaining_metadata = std::cmp::min( decode_read - position, size - meta_info.vec.len() );
+											meta_info.vec.extend_from_slice( &data[ position .. position + remaining_metadata ] );
+											position += remaining_metadata;
+											
+											// If it's reached the max size, then copy it over to last_full
+											if meta_info.vec.len() == size {
+												meta_info.remaining = meta_info.metaint;
+												last_full = Some( meta_info.vec.clone() );
+												meta_info.vec.clear();
+											}
+										}
+									}
+									
+									// Update the source's metadata
+									if let Some( metadata_vec ) = last_full {
+										arc.write().await.metadata_vec = metadata_vec;
+									}
+									
+									trimmed
+								} else {
+									data
+								}
+							};
+							
+							if !data.is_empty() {
+								arc.read().await.stats.write().await.bytes_read += data.len();
+								broadcast_to_clients( &arc, data, queue_size, burst_size ).await;
+							}
 						}
 						
 						// Check if the source needs to be disconnected
