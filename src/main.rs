@@ -361,19 +361,17 @@ impl StreamDecoder {
 		}
 	}
 
-	fn decode( &mut self, buf: &[ u8 ], length: usize ) -> Result< Option< Vec< u8 > >, Box< dyn Error > > {
+	fn decode( &mut self, out: &mut Vec< u8 >, buf: &[ u8 ], length: usize ) -> Result< usize, Box< dyn Error + Send > > {
 		if length == 0 || self.is_finished() {
-			Ok( None )
+			Ok( 0 )
 		} else {
 			match &self.encoding {
 				TransferEncoding::Identity => {
-					let mut slice = Vec::new();
-					slice.extend_from_slice( &buf[ .. length ] );
-					Ok( Some( slice ) )
+					out.extend_from_slice( &buf[ .. length ] );
+					Ok( length )
 				}
 				TransferEncoding::Chunked => {
-					let mut slice = Vec::new();
-
+					let mut read = 0;
 					let mut index = 0;
 					while index < length && self.remainder != 0 {
 						match self.remainder {
@@ -384,7 +382,13 @@ impl StreamDecoder {
 								if self.chunk.windows( 2 ).nth_back( 0 ) == Some( b"\r\n" ) {
 									// Ignore chunk extensions
 									if let Some( cutoff ) = self.chunk.iter().position( | &x | x == b';' || x == b'\r' ) {
-										self.remainder = usize::from_str_radix( std::str::from_utf8( &self.chunk[ .. cutoff ] )?, 16 )?;
+										self.remainder = match std::str::from_utf8( &self.chunk[ .. cutoff ] ) {
+											Ok( res ) =>  match usize::from_str_radix( res, 16 ) {
+												Ok( hex ) => hex,
+												Err( e ) => return Err( Box::new( std::io::Error::new( ErrorKind::InvalidData, format!( "Invalid value provided for chunk size: {}", e ) ) ) )
+											}
+											Err( e ) => return Err( Box::new( std::io::Error::new( ErrorKind::InvalidData, format!( "Could not parse chunk size: {}", e ) ) ) )
+										};
 										// Check if it's the last chunk
 										// Ignore trailers
 										if self.remainder != 0 {
@@ -402,7 +406,8 @@ impl StreamDecoder {
 								// No more chunk data should be read
 								if self.chunk.windows( 2 ).nth_back( 0 ) == Some( b"\r\n" ) {
 									// Append current data
-									slice.extend_from_slice( &self.chunk[ .. self.chunk.len() - 2 ] );
+									read += self.chunk.len() - 2;
+									out.extend_from_slice( &self.chunk[ .. self.chunk.len() - 2 ] );
 									// Prepare for reading the next chunk size
 									self.remainder = 1;
 									self.chunk.clear();
@@ -413,25 +418,22 @@ impl StreamDecoder {
 							v => {
 								// Get the chunk data
 								let max_read = std::cmp::min( length - index, v - 2 );
-								self.chunk.extend_from_slice( &buf[ index .. index + max_read] );
+								self.chunk.extend_from_slice( &buf[ index .. index + max_read ] );
 								index += max_read;
 								self.remainder -= max_read;
 							}
 						}
 					}
 
-					Ok( Some( slice ) )
+					Ok( read )
 				}
 				TransferEncoding::Length( _ ) => {
 					let allowed = std::cmp::min( length, self.remainder );
 					if allowed != 0 {
-						let mut slice = Vec::new();
-						slice.extend_from_slice( &buf[ .. allowed ] );
+						out.extend_from_slice( &buf[ .. allowed ] );
 						self.remainder -= allowed;
-						Ok( Some( slice ) )
-					} else {
-						Ok( None )
 					}
+					Ok( allowed )
 				}
 			}
 		}
@@ -616,18 +618,23 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 
 			if message.len() > body_offset {
 				let slice = &message[ body_offset .. ];
-				let decoded = decoder.decode( slice, message.len() - body_offset )?;
-				if let Some( data ) = decoded {
-					let size = data.len();
-					if size != 0 {
-						broadcast_to_clients( &arc, data, queue_size, burst_size ).await;
-						arc.read().await.stats.write().await.bytes_read += size;
+				let mut data = Vec::new();
+				match decoder.decode( &mut data, slice, message.len() - body_offset ) {
+					Ok( read ) => {
+						if read != 0 {
+							broadcast_to_clients( &arc, data, queue_size, burst_size ).await;
+							arc.read().await.stats.write().await.bytes_read += read;
+						}
+					}
+					Err( e ) => {
+						println!( "An error occured while decoding stream data from source {}: {}", arc.read().await.mountpoint, e );
+						arc.write().await.disconnect_flag = true;
 					}
 				}
 			}
 
 			// Listen for bytes
-			if !decoder.is_finished() {
+			if !decoder.is_finished() && !arc.read().await.disconnect_flag {
 				while {
 					// Read the incoming stream data until it closes
 					let mut buf = [ 0; 1024 ];
@@ -643,17 +650,22 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 						}
 					};
 					
-					let decoded = decoder.decode( &buf, read )?;
-					if let Some( data ) = decoded {
-						let size = data.len();
-						if size != 0 {
-							broadcast_to_clients( &arc, data, queue_size, burst_size ).await;
-							arc.read().await.stats.write().await.bytes_read += size;
+					let mut data = Vec::new();
+					match decoder.decode( &mut data, &buf, read ) {
+						Ok( decode_read ) => {
+							if decode_read != 0 {
+								broadcast_to_clients( &arc, data, queue_size, burst_size ).await;
+								arc.read().await.stats.write().await.bytes_read += decode_read;
+							}
+							
+							// Check if the source needs to be disconnected
+							read != 0 && !decoder.is_finished() && !arc.read().await.disconnect_flag
+						}
+						Err( e ) => {
+							println!( "An error occured while decoding stream data from source {}: {}", arc.read().await.mountpoint, e );
+							false
 						}
 					}
-	
-					// Check if the source needs to be disconnected
-					read != 0 && !decoder.is_finished() && !arc.read().await.disconnect_flag
 				}  {}
 			}
 
@@ -1352,7 +1364,7 @@ async fn connect_and_redirect( url: String, headers: Vec< String >, max_len: usi
 					Stream::Plain( TcpStream::connect( addr.clone() ).await? )
 				}
 			};
-			
+
 			// Build the path
 			let mut path = url.path().to_string();
 			if let Some( query ) = url.query() {
@@ -1502,7 +1514,7 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 	};
 
 	// read headers from server
-	let headers = vec![ format!( "User-Agent: {}", server_id ), "Connection: Closed".to_string() ];
+	let headers = vec![ format!( "User-Agent: {}", server_id ), "Connection: Closed".to_string(), "IcyMetadata:1".to_string() ];
 	let ( mut sock, buf ) = timeout( Duration::from_millis( header_timeout ), connect_and_redirect( format!( "{}{}", master_server.url, mount ), headers, http_max_len, http_max_redirects ) ).await??;
 
 	let mut headers = [ httparse::EMPTY_HEADER; 32 ];
@@ -1548,6 +1560,24 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 		None => return Err( Box::new( std::io::Error::new( ErrorKind::Other, "No Content-Type provided" ) ) )
 	};
 
+	struct MetaParser {
+		metaint: usize,
+		meta_vec: Vec< u8 >,
+		meta_current: usize,
+		meta_remaining: usize
+	}
+	
+	let metaint = match get_header( "Icy-Metaint", res.headers ) {
+		Some( val ) => std::str::from_utf8( val )?.parse::< usize >()?,
+		None => 0
+	};
+	let meta_info = MetaParser {
+		metaint,
+		meta_vec: Vec::new(),
+		meta_current: 0,
+		meta_remaining: metaint
+	};
+
 	// Parse the headers for the source properties
 	populate_properties( &mut properties, res.headers );
 	properties.uagent = Some( server_id );
@@ -1589,12 +1619,22 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 		
 		if buf.len() > body_offset {
 			let slice = &buf[ body_offset .. ];
-			let decoded = decoder.decode( slice, buf.len() - body_offset )?;
-			if let Some( data ) = decoded {
-				let size = data.len();
-				if size != 0 {
-					broadcast_to_clients( &arc, data, queue_size, burst_size ).await;
-					arc.read().await.stats.write().await.bytes_read += size;
+			let mut data = Vec::new();
+			match decoder.decode( &mut data, slice, buf.len() - body_offset ) {
+				Ok( read ) => {
+					if read != 0 {
+						// Parse the data for metadata if possible
+						// Requires metaint
+						// Keeping track of current pos
+						// Fetching the vec
+						// Parse the data with regex
+						broadcast_to_clients( &arc, data, queue_size, burst_size ).await;
+						arc.read().await.stats.write().await.bytes_read += read;
+					}
+				}
+				Err( e ) => {
+					println!( "An error occured while decoding stream data from relay {}: {}", arc.read().await.mountpoint, e );
+					arc.write().await.disconnect_flag = true;
 				}
 			}
 		}
@@ -1616,17 +1656,22 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 					}
 				};
 	
-				let decoded = decoder.decode( &buf, read )?;
-				if let Some( data ) = decoded {
-					let size = data.len();
-					if size != 0 {
-						broadcast_to_clients( &arc, data, queue_size, burst_size ).await;
-						arc.read().await.stats.write().await.bytes_read += size;
+				let mut data = Vec::new();
+				match decoder.decode( &mut data, &buf, read ) {
+					Ok( decode_read ) => {
+						if decode_read != 0 {
+							broadcast_to_clients( &arc, data, queue_size, burst_size ).await;
+							arc.read().await.stats.write().await.bytes_read += decode_read;
+						}
+						
+						// Check if the source needs to be disconnected
+						read != 0 && !decoder.is_finished() && !arc.read().await.disconnect_flag
+					}
+					Err( e ) => {
+						println!( "An error occured while decoding stream data from relay {}: {}", arc.read().await.mountpoint, e );
+						false
 					}
 				}
-	
-				// Check if the source needs to be disconnected
-				read != 0 && !decoder.is_finished() && !arc.read().await.disconnect_flag
 			}  {}
 		}
 
@@ -1945,7 +1990,7 @@ async fn send_unauthorized( stream: &mut TcpStream, id: &str, message: Option< (
 	Ok( () )
 }
 
-async fn server_info(stream: &mut TcpStream)  -> Result< (), Box< dyn Error > > {
+async fn server_info( stream: &mut TcpStream )  -> Result< (), Box< dyn Error > > {
 	stream.write_all( ( format!( "Date: {}\r\n", fmt_http_date( SystemTime::now() ) ) ).as_bytes() ).await?;
 	stream.write_all( b"Cache-Control: no-cache, no-store\r\n" ).await?;
 	stream.write_all( b"Expires: Mon, 26 Jul 1997 05:00:00 GMT\r\n" ).await?;
