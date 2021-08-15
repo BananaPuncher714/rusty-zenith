@@ -335,6 +335,113 @@ impl Stream {
 	}
 }
 
+#[ derive( PartialEq ) ]
+enum TransferEncoding {
+	Identity,
+	Chunked,
+	Length( usize )
+}
+
+struct StreamDecoder {
+	encoding: TransferEncoding,
+	remainder: usize,
+	chunk: Vec< u8 >
+}
+
+impl StreamDecoder {
+	fn new( encoding: TransferEncoding ) -> StreamDecoder {
+		let remainder = match &encoding {
+			TransferEncoding::Length( v ) => *v,
+			_ => 1
+		};
+		StreamDecoder {
+			encoding,
+			remainder,
+			chunk: Vec::new()
+		}
+	}
+
+	fn decode( &mut self, buf: &[ u8 ], length: usize ) -> Result< Option< Vec< u8 > >, Box< dyn Error > > {
+		if length == 0 || self.is_finished() {
+			Ok( None )
+		} else {
+			match &self.encoding {
+				TransferEncoding::Identity => {
+					let mut slice = Vec::new();
+					slice.extend_from_slice( &buf[ .. length ] );
+					Ok( Some( slice ) )
+				}
+				TransferEncoding::Chunked => {
+					let mut slice = Vec::new();
+
+					let mut index = 0;
+					while index < length && self.remainder != 0 {
+						match self.remainder {
+							1 => {
+								// Get the chunk size
+								self.chunk.push( buf[ index ] );
+								index += 1;
+								if self.chunk.windows( 2 ).nth_back( 0 ) == Some( b"\r\n" ) {
+									// Ignore chunk extensions
+									if let Some( cutoff ) = self.chunk.iter().position( | &x | x == b';' || x == b'\r' ) {
+										self.remainder = usize::from_str_radix( std::str::from_utf8( &self.chunk[ .. cutoff ] )?, 16 )?;
+										// Check if it's the last chunk
+										// Ignore trailers
+										if self.remainder != 0 {
+											// +2 for remainder
+											// +2 for extra CRLF
+											self.remainder += 4;
+											self.chunk.clear();
+										}
+									} else {
+										return Err( Box::new( std::io::Error::new( ErrorKind::InvalidData, "Missing CRLF" ) ) )
+									}
+								}
+							}
+							2 => {
+								// No more chunk data should be read
+								if self.chunk.windows( 2 ).nth_back( 0 ) == Some( b"\r\n" ) {
+									// Append current data
+									slice.extend_from_slice( &self.chunk[ .. self.chunk.len() - 2 ] );
+									// Prepare for reading the next chunk size
+									self.remainder = 1;
+									self.chunk.clear();
+								} else {
+									return Err( Box::new( std::io::Error::new( ErrorKind::InvalidData, "Missing CRLF from chunk" ) ) )
+								}
+							}
+							v => {
+								// Get the chunk data
+								let max_read = std::cmp::min( length - index, v - 2 );
+								self.chunk.extend_from_slice( &buf[ index .. index + max_read] );
+								index += max_read;
+								self.remainder -= max_read;
+							}
+						}
+					}
+
+					Ok( Some( slice ) )
+				}
+				TransferEncoding::Length( _ ) => {
+					let allowed = std::cmp::min( length, self.remainder );
+					if allowed != 0 {
+						let mut slice = Vec::new();
+						slice.extend_from_slice( &buf[ .. allowed ] );
+						self.remainder -= allowed;
+						Ok( Some( slice ) )
+					} else {
+						Ok( None )
+					}
+				}
+			}
+		}
+	}
+
+	fn is_finished( &self ) -> bool {
+		self.encoding != TransferEncoding::Identity && self.remainder == 0
+	}
+}
+
 async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStream ) -> Result< (), Box< dyn Error > > {
 	let ( server_id, header_timeout, http_max_len ) = {
 		let properties = &server.read().await.properties;
@@ -440,19 +547,42 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				return send_forbidden( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Too many sources connected" ) ) ).await;
 			}
 
+			let mut decoder: StreamDecoder;
+			
 			if method == "SOURCE" {
 				// Give an 200 OK response
 				send_ok( &mut stream, &server_id, None ).await?;
+				
+				decoder = StreamDecoder::new( TransferEncoding::Identity );
 			} else {
 				// Verify that the transfer encoding is identity or not included
 				// No support for chunked or encoding ATM
 				// TODO Add support for transfer encoding options as specified here: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Transfer-Encoding
 				// TODO Also potentially add support for content length? Not sure if that's a particularly large priority
-				match get_header( "Transfer-Encoding", headers ) {
-					Some( v ) if v != b"identity" => return send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Unsupported transfer encoding" ) ) ).await,
-					_ => ()
+				match ( get_header( "Transfer-Encoding", headers ), get_header( "Content-Length", headers ) ) {
+					( Some( b"identity"), Some( value ) ) | ( None, Some( value ) ) => {
+						// Use content length decoder
+						match std::str::from_utf8( value ) {
+							Ok( string ) => {
+								match string.parse::< usize >() {
+									Ok( length ) => decoder = StreamDecoder::new( TransferEncoding::Length( length ) ),
+									Err( _ ) => return send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Invalid Content-Length" ) ) ).await
+								}
+							}
+							Err( _ ) => return send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Unknown unicode found in Content-Length" ) ) ).await
+						}
+					}
+					( Some( b"chunked" ), None ) => {
+						// Use chunked decoder
+						decoder = StreamDecoder::new( TransferEncoding::Chunked );
+					}
+					( Some( b"identity" ), None ) | ( None, None ) => {
+						// Use identity
+						decoder = StreamDecoder::new( TransferEncoding::Identity );
+					}
+					_ => return send_bad_request( &mut stream, &server_id, Some( ( "text/plain; charset=utf-8", "Unsupported transfer encoding" ) ) ).await
 				}
-
+				
 				// Check if client sent Expect: 100-continue in header, if that's the case we will need to return 100 in status code
 				// Without it, it means that client has no body to send, we will stop if that's the case
 				match get_header( "Expect", headers ) {
@@ -486,41 +616,46 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 
 			if message.len() > body_offset {
 				let slice = &message[ body_offset .. ];
-				broadcast_to_clients( &arc, slice.to_vec(), queue_size, burst_size ).await;
+				let decoded = decoder.decode( slice, message.len() - body_offset )?;
+				if let Some( data ) = decoded {
+					let size = data.len();
+					if size != 0 {
+						broadcast_to_clients( &arc, data, queue_size, burst_size ).await;
+						arc.read().await.stats.write().await.bytes_read += size;
+					}
+				}
 			}
 
 			// Listen for bytes
-			while {
-				// Read the incoming stream data until it closes
-				let mut buf = [ 0; 1024 ];
-				let read = match timeout( Duration::from_millis( source_timeout ), async {
-					match stream.read( &mut buf ).await {
-						Ok( n ) => n,
-						Err( e ) => {
+			if !decoder.is_finished() {
+				while {
+					// Read the incoming stream data until it closes
+					let mut buf = [ 0; 1024 ];
+					let read = match timeout( Duration::from_millis( source_timeout ), stream.read( &mut buf ) ).await {
+						Ok( Ok( n ) ) => n,
+						Ok( Err( e ) ) => {
 							println!( "An error occured while reading stream data from source {}: {}", arc.read().await.mountpoint, e );
 							0
 						}
+						Err( _ ) => {
+							println!( "A source timed out: {}", arc.read().await.mountpoint );
+							0
+						}
+					};
+					
+					let decoded = decoder.decode( &buf, read )?;
+					if let Some( data ) = decoded {
+						let size = data.len();
+						if size != 0 {
+							broadcast_to_clients( &arc, data, queue_size, burst_size ).await;
+							arc.read().await.stats.write().await.bytes_read += size;
+						}
 					}
-				} ).await {
-					Ok( n ) => n,
-					Err( _ ) => {
-						println!( "A source timed out: {}", arc.read().await.mountpoint );
-						0
-					}
-				};
-
-				if read != 0 {
-					// Get the slice
-					let mut slice: Vec< u8 > = Vec::new();
-					slice.extend_from_slice( &buf[ .. read  ] );
-
-					broadcast_to_clients( &arc, slice, queue_size, burst_size ).await;
-					arc.read().await.stats.write().await.bytes_read += read;
-				}
-
-				// Check if the source needs to be disconnected
-				read != 0 && !arc.read().await.disconnect_flag
-			}  {}
+	
+					// Check if the source needs to be disconnected
+					read != 0 && !decoder.is_finished() && !arc.read().await.disconnect_flag
+				}  {}
+			}
 
 			let mut source = arc.write().await;
 			let fallback = source.fallback.clone();
@@ -1240,7 +1375,7 @@ async fn connect_and_redirect( url: String, headers: Vec< String >, max_len: usi
 			if !auth_included {
 				if let Some( passwd ) = url.password() {
 					let encoded = base64::encode( format!( "{}:{}", url.username(), passwd ) );
-					req_buf.extend_from_slice( format!( "Authorization: Basic {}\r\n", encoded ) );
+					req_buf.extend_from_slice( format!( "Authorization: Basic {}\r\n", encoded ).as_bytes() );
 				}
 			}
 			req_buf.extend_from_slice( b"\r\n" );
@@ -1388,6 +1523,24 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 	if get_header( "icy-name", res.headers ).is_none() {
 		return Err( Box::new( std::io::Error::new( ErrorKind::Other, "Is this a valid icecast stream?" ) ) );
 	}
+	
+	let mut decoder = match ( get_header( "Transfer-Encoding", res.headers ), get_header( "Content-Length", res.headers ) ) {
+		( Some( b"identity"), Some( value ) ) | ( None, Some( value ) ) => {
+			// Use content length decoder
+			match std::str::from_utf8( value ) {
+				Ok( string ) => {
+					match string.parse::< usize >() {
+						Ok( length ) => StreamDecoder::new( TransferEncoding::Length( length ) ),
+						Err( _ ) => return Err( Box::new( std::io::Error::new( ErrorKind::InvalidData, "Invalid Content-Length" ) ) )
+					}
+				}
+				Err( _ ) => return Err( Box::new( std::io::Error::new( ErrorKind::InvalidData, "Unknown unicode found in Content-Length" ) ) )
+			}
+		}
+		( Some( b"chunked" ), None ) => StreamDecoder::new( TransferEncoding::Chunked ),
+		( Some( b"identity" ), None ) | ( None, None ) => StreamDecoder::new( TransferEncoding::Identity ),
+		_ => return Err( Box::new( std::io::Error::new( ErrorKind::InvalidData, "Unsupported Transfer-Encoding" ) ) )
+	};
 
 	// Sources must have a content type
 	let mut properties = match get_header( "Content-Type", res.headers ) {
@@ -1436,43 +1589,46 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 		
 		if buf.len() > body_offset {
 			let slice = &buf[ body_offset .. ];
-			broadcast_to_clients( &arc, slice.to_vec(), queue_size, burst_size ).await;
+			let decoded = decoder.decode( slice, buf.len() - body_offset )?;
+			if let Some( data ) = decoded {
+				let size = data.len();
+				if size != 0 {
+					broadcast_to_clients( &arc, data, queue_size, burst_size ).await;
+					arc.read().await.stats.write().await.bytes_read += size;
+				}
+			}
 		}
 		
 		// Listen for bytes
-		while {
-			// Read the incoming stream data until it closes
-			let mut buf = [ 0; 1024 ];
-			let read = match timeout( Duration::from_millis( source_timeout ), async {
-				match sock.read( &mut buf ).await {
-					Ok( n ) => n,
-					Err( e ) => {
+		if !decoder.is_finished() {
+			while {
+				// Read the incoming stream data until it closes
+				let mut buf = [ 0; 1024 ];
+				let read = match timeout( Duration::from_millis( source_timeout ), sock.read( &mut buf ) ).await {
+					Ok( Ok( n ) ) => n,
+					Ok( Err( e ) ) => {
 						println!( "An error occured while reading stream data from relay {}: {}", arc.read().await.mountpoint, e );
 						0
 					}
+					Err( _ ) => {
+						println!( "A relay timed out: {}", arc.read().await.mountpoint );
+						0
+					}
+				};
+	
+				let decoded = decoder.decode( &buf, read )?;
+				if let Some( data ) = decoded {
+					let size = data.len();
+					if size != 0 {
+						broadcast_to_clients( &arc, data, queue_size, burst_size ).await;
+						arc.read().await.stats.write().await.bytes_read += size;
+					}
 				}
-			} ).await {
-				Ok( n ) => n,
-				Err( _ ) => {
-					println!( "A relay timed out: {}", arc.read().await.mountpoint );
-					0
-				}
-			};
-
-			if read != 0 {
-				// Get the slice
-				let mut slice: Vec< u8 > = Vec::new();
-				slice.extend_from_slice( &buf[ .. read  ] );
-
-				// TODO Add metadata
-
-				broadcast_to_clients( &arc, slice, queue_size, burst_size ).await;
-				arc.read().await.stats.write().await.bytes_read += read;
-			}
-
-			// Check if the source needs to be disconnected
-			read != 0 && !arc.read().await.disconnect_flag
-		}  {}
+	
+				// Check if the source needs to be disconnected
+				read != 0 && !decoder.is_finished() && !arc.read().await.disconnect_flag
+			}  {}
+		}
 
 		let mut source = arc.write().await;
 		let fallback = source.fallback.clone();
@@ -1571,7 +1727,7 @@ async fn slave_node( server: Arc< RwLock< Server > >, master_server: MasterServe
 		}
 		
 		// update interval
-		tokio::time::sleep(tokio::time::Duration::from_secs( master_server.update_interval ) ).await;
+		tokio::time::sleep( tokio::time::Duration::from_secs( master_server.update_interval ) ).await;
 	}
 }
 
