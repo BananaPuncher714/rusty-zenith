@@ -560,7 +560,6 @@ async fn handle_connection( server: Arc< RwLock< Server > >, mut stream: TcpStre
 				// Verify that the transfer encoding is identity or not included
 				// No support for chunked or encoding ATM
 				// TODO Add support for transfer encoding options as specified here: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Transfer-Encoding
-				// TODO Also potentially add support for content length? Not sure if that's a particularly large priority
 				match ( get_header( "Transfer-Encoding", headers ), get_header( "Content-Length", headers ) ) {
 					( Some( b"identity"), Some( value ) ) | ( None, Some( value ) ) => {
 						// Use content length decoder
@@ -1507,6 +1506,7 @@ async fn master_server_mountpoints( server: &Arc< RwLock< Server > >, master_inf
 }
 
 #[ allow( clippy::map_entry ) ]
+#[ allow( clippy::blocks_in_if_conditions ) ]
 async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: MasterServer, mount: String ) -> Result< (), Box< dyn Error > > {
 	let ( server_id, header_timeout, http_max_len, http_max_redirects ) = {
 		let properties = &server.read().await.properties;
@@ -1645,7 +1645,7 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 										position += 1;
 									} else {
 										// Reading in metadata
-										let size = 1 + ( meta_info.vec[ 0 ] << 4 ) as usize;
+										let size = 1 + ( ( meta_info.vec[ 0 ] as usize ) << 4 );
 										let remaining_metadata = std::cmp::min( read - position, size - meta_info.vec.len() );
 										meta_info.vec.extend_from_slice( &data[ position .. position + remaining_metadata ] );
 										position += remaining_metadata;
@@ -1661,9 +1661,61 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 								
 								// Update the source's metadata
 								if let Some( metadata_vec ) = last_full {
-									arc.write().await.metadata_vec = metadata_vec;
+									if !{
+										let serv_vec = &arc.read().await.metadata_vec;
+										serv_vec.len() == metadata_vec.len() && serv_vec.iter().eq( metadata_vec.iter() )
+									} {
+										if metadata_vec[ .. ] == [ 1; 0 ] {
+											let mut serv = arc.write().await;
+											println!( "Updated relay {} metadata with no title and url", serv.mountpoint );
+											serv.metadata_vec = vec![ 0 ];
+											serv.metadata = None;
+										} else {
+											let cut = {
+												let mut last = metadata_vec.len();
+												while metadata_vec[ last - 1 ] == 0 {
+													last -= 1;
+												}
+												last
+											};
+											if let Ok( meta_str ) = std::str::from_utf8( &metadata_vec[ 1 .. cut ] ) {
+												let reg = Regex::new( r"^StreamTitle='(.+?)';StreamUrl='(.+?)';$" ).unwrap();
+												if let Some( captures ) = reg.captures( meta_str ) {
+													let metadata = IcyMetadata {
+														title: {
+															let m_str = captures.get( 1 ).unwrap().as_str();
+															if m_str.is_empty() {
+																None
+															} else {
+																Some( m_str.to_string() )
+															}
+														},
+														url: {
+															let m_str = captures.get( 2 ).unwrap().as_str();
+															if m_str.is_empty() {
+																None
+															} else {
+																Some( m_str.to_string() )
+															}
+														}
+													};
+
+													let mut serv = arc.write().await;
+													println!( "Updated relay {} metadata with title '{}' and url '{}'", serv.mountpoint, metadata.title.as_ref().unwrap_or( &"".to_string() ), metadata.url.as_ref().unwrap_or( &"".to_string() ) );
+													serv.metadata_vec = metadata_vec;
+													serv.metadata = Some( metadata );
+												} else {
+													println!( "Unknown metadata format received from relay {}: `{}`", arc.read().await.mountpoint, meta_str );
+													arc.write().await.disconnect_flag = true;
+												}
+											} else {
+												println!( "Invalid metadata parsed from relay {}", arc.read().await.mountpoint );
+												arc.write().await.disconnect_flag = true;
+											}
+										}
+									}
 								}
-								
+									
 								trimmed
 							} else {
 								data
@@ -1684,7 +1736,7 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 		}
 		
 		// Listen for bytes
-		if !decoder.is_finished() {
+		if !decoder.is_finished() && !arc.read().await.disconnect_flag {
 			while {
 				// Read the incoming stream data until it closes
 				let mut buf = [ 0; 1024 ];
@@ -1727,7 +1779,7 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 											position += 1;
 										} else {
 											// Reading in metadata
-											let size = 1 + ( meta_info.vec[ 0 ] << 4 ) as usize;
+											let size = 1 + ( ( meta_info.vec[ 0 ] as usize ) << 4 );
 											let remaining_metadata = std::cmp::min( decode_read - position, size - meta_info.vec.len() );
 											meta_info.vec.extend_from_slice( &data[ position .. position + remaining_metadata ] );
 											position += remaining_metadata;
@@ -1743,7 +1795,59 @@ async fn relay_mountpoint( server: Arc< RwLock< Server > >, master_server: Maste
 									
 									// Update the source's metadata
 									if let Some( metadata_vec ) = last_full {
-										arc.write().await.metadata_vec = metadata_vec;
+										if !{
+											let serv_vec = &arc.read().await.metadata_vec;
+											serv_vec.len() == metadata_vec.len() && serv_vec.iter().eq( metadata_vec.iter() )
+										} {
+											if metadata_vec[ .. ] == [ 1; 0 ] {
+												let mut serv = arc.write().await;
+												println!( "Updated relay {} metadata with no title and url", serv.mountpoint );
+												serv.metadata_vec = vec![ 0 ];
+												serv.metadata = None;
+											} else {
+												let cut = {
+													let mut last = metadata_vec.len();
+													while metadata_vec[ last - 1 ] == 0 {
+														last -= 1;
+													}
+													last
+												};
+												if let Ok( meta_str ) = std::str::from_utf8( &metadata_vec[ 1 .. cut ] ) {
+													let reg = Regex::new( r"^StreamTitle='(.*?)';StreamUrl='(.*?)';$" ).unwrap();
+													if let Some( captures ) = reg.captures( meta_str ) {
+														let metadata = IcyMetadata {
+															title: {
+																let m_str = captures.get( 1 ).unwrap().as_str();
+																if m_str.is_empty() {
+																	None
+																} else {
+																	Some( m_str.to_string() )
+																}
+															},
+															url: {
+																let m_str = captures.get( 2 ).unwrap().as_str();
+																if m_str.is_empty() {
+																	None
+																} else {
+																	Some( m_str.to_string() )
+																}
+															}
+														};
+
+														let mut serv = arc.write().await;
+														println!( "Updated relay {} metadata with title '{}' and url '{}'", serv.mountpoint, metadata.title.as_ref().unwrap_or( &"".to_string() ), metadata.url.as_ref().unwrap_or( &"".to_string() ) );
+														serv.metadata_vec = metadata_vec;
+														serv.metadata = Some( metadata );
+													} else {
+														println!( "Unknown metadata format received from relay {}: `{}`", arc.read().await.mountpoint, meta_str );
+														arc.write().await.disconnect_flag = true;
+													}
+												} else {
+													println!( "Invalid metadata parsed from relay {}", arc.read().await.mountpoint );
+													arc.write().await.disconnect_flag = true;
+												}
+											}
+										}
 									}
 									
 									trimmed
